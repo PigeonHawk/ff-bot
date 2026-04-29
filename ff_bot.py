@@ -9,7 +9,7 @@ import asyncpg
 #  CONFIG
 # ─────────────────────────────────────────────
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ASSET_BASE_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/assets/"
+ASSET_BASE_URL = "https://raw.githubusercontent.com/PigeonHawk/ff-bot/main/"
 FF_CATEGORY_ID = 1498963161934467184
 
 # ─────────────────────────────────────────────
