@@ -1016,6 +1016,48 @@ async def show_gil(ctx: commands.Context):
 
 
 # ─────────────────────────────────────────────
+#  !ffreset — master reset, wipe session and restart character creation
+# ─────────────────────────────────────────────
+@bot.command(name="ffreset")
+async def ffreset(ctx: commands.Context):
+    if not _is_game_channel(ctx): return
+    if ctx.author.id not in player_channels or player_channels[ctx.author.id] != ctx.channel.id:
+        await ctx.send("You can only reset from your own FF Arena channel."); return
+
+    cid = ctx.channel.id
+
+    # Wipe any active duel this channel is involved in
+    if cid in active_duels:
+        duel = active_duels[cid]
+        # Revoke opponent write access if they were granted it
+        try:
+            await ctx.channel.set_permissions(duel.opponent, overwrite=None)
+        except Exception:
+            pass
+        del active_duels[cid]
+
+    # Cancel any pending duel challenge sent by this player
+    if ctx.author.id in pending_duels:
+        del pending_duels[ctx.author.id]
+
+    # Wipe the game session entirely
+    if cid in active_sessions:
+        del active_sessions[cid]
+
+    em = discord.Embed(
+        title="🔄 Character Reset",
+        description=(
+            f"{ctx.author.mention} has been reset!\n\n"
+            "💰 Gil balance and hard mode unlocks are **preserved**.\n"
+            "Choose a new class to start fresh."
+        ),
+        color=0x2a55c0,
+    )
+    await ctx.send(embed=em)
+    await _send_class_select(ctx.channel)
+
+
+# ─────────────────────────────────────────────
 #  !stop — abort current PvE battle, return to enemy select
 # ─────────────────────────────────────────────
 @bot.command(name="stop")
@@ -1083,4 +1125,3 @@ async def on_ready():
     print(f"✅ {bot.user} is online and ready!")
 
 bot.run(BOT_TOKEN)
-
