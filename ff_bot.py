@@ -9,7 +9,7 @@ import asyncpg
 #  CONFIG
 # ─────────────────────────────────────────────
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ASSET_BASE_URL = "https://raw.githubusercontent.com/PigeonHawk/ff-bot/main/"
+ASSET_BASE_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/assets/"
 FF_CATEGORY_ID = 1498963161934467184
 
 # ─────────────────────────────────────────────
@@ -468,6 +468,382 @@ class DuelSession:
         return None
 
 
+
+# ─────────────────────────────────────────────
+#  BATTLE UI VIEWS  (discord.ui buttons)
+# ─────────────────────────────────────────────
+
+class RollView(discord.ui.View):
+    """Shown at the start of the player's turn — Roll or Defend."""
+    def __init__(self, session):
+        super().__init__(timeout=300)
+        self.session = session
+
+    @discord.ui.button(label="🎲 Roll Dice", style=discord.ButtonStyle.primary)
+    async def roll_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        base = random.randint(1, 6)
+        total = base + s.stored; s.stored = 0
+        s.pts_left = s.pts_total = total
+        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+        note  = f" (+{total - base} stored) = **{total}**" if total > base else ""
+        self.stop()
+        await interaction.response.send_message(
+            f"{faces[base-1]} **{interaction.user.display_name}** rolled **{base}**{note}! **{s.pts_left}pt** to spend.",
+            view=MoveView(s, interaction.channel)
+        )
+        await s.refresh_pins()
+
+    @discord.ui.button(label="🛡 Defend", style=discord.ButtonStyle.secondary)
+    async def defend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        base = random.randint(1, 6)
+        s.stored += base; s.p_defend = True
+        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+        self.stop()
+        await interaction.response.send_message(
+            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** stored for next turn. Damage halved this turn."
+        )
+        await s.refresh_pins()
+        await _enemy_turn_ui(interaction.channel, s)
+
+    @discord.ui.button(label="🛑 Stop Battle", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        self.stop()
+        await _reset_battle_state(s)
+        em = discord.Embed(title="⚔ Battle Stopped",
+            description="Returning to enemy select. Press **Fight** to choose your next opponent.",
+            color=0x2a55c0)
+        await interaction.response.send_message(embed=em, view=FightMenuView(s))
+
+
+class MoveView(discord.ui.View):
+    """Shown after rolling — queue moves then execute."""
+    def __init__(self, session, channel):
+        super().__init__(timeout=300)
+        self.session = session
+        self.channel = channel
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        self.clear_items()
+        s = self.session
+        MOVE_DEFS = [
+            ("⚔ Slash  (1pt)",   "slash",   discord.ButtonStyle.secondary, 1),
+            ("☠ Poison  (3pt)",  "poison",  discord.ButtonStyle.secondary, 3),
+            ("♻ Regen  (3pt)",   "regen",   discord.ButtonStyle.success,   3),
+            ("💚 Cure  (4pt)",    "cure",    discord.ButtonStyle.success,   4),
+            ("🔥 Fire  (5pt)",    "fire",    discord.ButtonStyle.danger,    5),
+            ("❄ Ice  (5pt)",     "ice",     discord.ButtonStyle.danger,    5),
+            ("⚡ Thunder  (5pt)", "thunder", discord.ButtonStyle.danger,    5),
+        ]
+        for label, key, style, cost in MOVE_DEFS:
+            btn = discord.ui.Button(
+                label=label, style=style,
+                disabled=s.pts_left < cost,
+                custom_id=f"move_{key}"
+            )
+            btn.callback = self._make_callback(key, cost)
+            self.add_item(btn)
+        # Execute button
+        exec_btn = discord.ui.Button(
+            label="✅ Execute Actions" if s.queue else "✅ Execute",
+            style=discord.ButtonStyle.primary,
+            disabled=len(s.queue) == 0,
+            custom_id="execute"
+        )
+        exec_btn.callback = self._execute_callback
+        self.add_item(exec_btn)
+
+    def _make_callback(self, key, cost):
+        async def callback(interaction: discord.Interaction):
+            s = self.session
+            if interaction.user.id != s.player.id:
+                await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+            if s.pts_left < cost:
+                await interaction.response.send_message(f"Not enough points for {key}!", ephemeral=True); return
+            s.pts_left -= cost
+            s.queue.append(key)
+            await s.refresh_pins()
+            self._refresh_buttons()
+            queue_str = " → ".join(q.capitalize() for q in s.queue)
+            await interaction.response.edit_message(
+                content=f"✅ **{key.capitalize()}** queued! Queue: **{queue_str}** | **{s.pts_left}pt** left",
+                view=self
+            )
+        return callback
+
+    async def _execute_callback(self, interaction: discord.Interaction):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        if not s.queue:
+            await interaction.response.send_message("Nothing queued!", ephemeral=True); return
+        self.stop()
+        lines = []
+        for mk in s.queue:
+            m = MOVES[mk]
+            if m["type"] == "atk":
+                raw = random.randint(*m["dmg"])
+                if s.hard_mode:
+                    dmg, outcome = calc_hit(raw)
+                else:
+                    dmg, outcome = raw, "normal"
+                if dmg > 0: s.e_hp = max(0, s.e_hp - dmg)
+                lines.append(hit_line(mk.capitalize(), s.char_name, s.enemy["name"], outcome, dmg))
+            elif m["type"] == "heal":
+                h = random.randint(*m["heal"]); s.p_hp = min(s.p_hp_max, s.p_hp + h)
+                lines.append(f"💚 **Cure** restores **{h}** HP!")
+            elif m["type"] == "status":
+                if m["effect"] == "poison": s.e_poison = 3; lines.append(f"☠ **Poison** inflicted on {s.enemy['name']}!")
+                elif m["effect"] == "regen": s.p_regen = 3; lines.append("♻ **Regen** granted!")
+        s.queue = []
+        await interaction.response.edit_message(content="\n".join(lines), view=None)
+        await s.refresh_pins()
+        if s.e_hp <= 0:
+            await s.refresh_pins("🏆 Victory!", "💀 Defeated")
+            await _end_pve_ui(interaction.channel, s, won=True); return
+        await _enemy_turn_ui(interaction.channel, s)
+
+
+class FightMenuView(discord.ui.View):
+    """Enemy selection buttons."""
+    def __init__(self, session):
+        super().__init__(timeout=300)
+        self.session = session
+        for key, e in ENEMIES.items():
+            unlocked = key in session.unlocked_hard
+            btn = discord.ui.Button(
+                label=f"⚔ {e['name']}",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"fight_{key}"
+            )
+            btn.callback = self._make_fight_callback(key, False)
+            self.add_item(btn)
+            if unlocked:
+                hard_btn = discord.ui.Button(
+                    label=f"🔴 {e['name']} (Hard)",
+                    style=discord.ButtonStyle.danger,
+                    custom_id=f"fight_{key}_hard"
+                )
+                hard_btn.callback = self._make_fight_callback(key, True)
+                self.add_item(hard_btn)
+
+    def _make_fight_callback(self, key, hard):
+        async def callback(interaction: discord.Interaction):
+            s = self.session
+            if interaction.user.id != s.player.id:
+                await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+            self.stop()
+            s.reset_for_battle(key, hard=hard)
+            if hard:
+                s.p_hp_max = s.chosen_class["hp"] + 50
+                s.p_hp     = s.p_hp_max
+            mode_tag = "  🔴 HARD MODE" if hard else ""
+            await interaction.response.send_message(f"═══════════  ⚔ BATTLE START{mode_tag}  ═══════════")
+            ch = interaction.channel
+            p_msg = await ch.send(embed=pve_player_card(s))
+            e_msg = await ch.send(embed=pve_enemy_card(s))
+            await pin_msg(p_msg); await pin_msg(e_msg)
+            s.pinned_player = p_msg; s.pinned_enemy = e_msg
+            await ch.send("Your turn! What will you do?", view=RollView(s))
+        return callback
+
+
+class DuelMoveView(discord.ui.View):
+    """One-move buttons for PvP duels."""
+    def __init__(self, duel, channel):
+        super().__init__(timeout=300)
+        self.duel    = duel
+        self.channel = channel
+        DUEL_DEFS = [
+            ("⚔ Slash",    "slash",   discord.ButtonStyle.secondary),
+            ("☠ Poison",   "poison",  discord.ButtonStyle.secondary),
+            ("♻ Regen",    "regen",   discord.ButtonStyle.success),
+            ("💚 Cure",     "cure",    discord.ButtonStyle.success),
+            ("🔥 Fire",     "fire",    discord.ButtonStyle.danger),
+            ("❄ Ice",      "ice",     discord.ButtonStyle.danger),
+            ("⚡ Thunder",  "thunder", discord.ButtonStyle.danger),
+        ]
+        for label, key, style in DUEL_DEFS:
+            btn = discord.ui.Button(label=label, style=style, custom_id=f"duel_{key}")
+            btn.callback = self._make_callback(key)
+            self.add_item(btn)
+
+    def _make_callback(self, move_key):
+        async def callback(interaction: discord.Interaction):
+            duel = self.duel
+            if not duel.active:
+                await interaction.response.send_message("This duel is already over!", ephemeral=True); return
+            if interaction.user.id != duel.current_player().id:
+                await interaction.response.send_message(
+                    f"It's not your turn! Waiting for **{duel.current_player().display_name}**.", ephemeral=True); return
+            attacker = "challenger" if interaction.user.id == duel.challenger.id else "opponent"
+            log = duel.apply_move(move_key, attacker)
+            self.stop()
+            await interaction.response.edit_message(content=log, view=None)
+            await duel.refresh_pins()
+            winner_side = duel.is_over()
+            if winner_side:
+                await _end_duel_ui(interaction.channel, duel, winner_side); return
+            if duel.turn == "opponent":
+                tick = duel.tick_status()
+                if tick: await interaction.channel.send("\n".join(tick))
+                await duel.refresh_pins()
+                winner_side = duel.is_over()
+                if winner_side:
+                    await _end_duel_ui(interaction.channel, duel, winner_side); return
+            duel.swap_turn()
+            await duel.refresh_pins()
+            whose = duel.current_player().mention
+            await interaction.channel.send(f"{whose} — your turn! Pick a move:", view=DuelMoveView(duel, interaction.channel))
+        return callback
+
+
+async def _enemy_turn_ui(channel: discord.TextChannel, s):
+    """Enemy takes their turn then sends the Roll/Defend view."""
+    tick = []
+    if s.p_poison > 0: s.p_hp = max(0, s.p_hp - 3); s.p_poison -= 1; tick.append("☠ Poison deals **3** damage to you!")
+    if s.p_regen  > 0:
+        h = random.randint(5, 10); s.p_hp = min(s.p_hp_max, s.p_hp + h); s.p_regen -= 1
+        tick.append(f"♻ Regen restores **{h}** HP!")
+    if tick: await channel.send("\n".join(tick))
+    if s.p_hp <= 0:
+        await s.refresh_pins("💀 Defeated", "👹 Wins!")
+        await _end_pve_ui(channel, s, won=False); return
+
+    e = s.enemy; e_roll = random.randint(1, 6); e_pts = e_roll
+    faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+    lines = [f"👹 **{e['name']}** rolls {faces[e_roll-1]} (**{e_roll}pt**)"]
+
+    if s.e_hp / s.e_hp_max < 0.3:
+        sig = e["sig"]
+        sig_range = e["hard"]["sig_dmg"] if s.hard_mode else sig["dmg"]
+        raw = random.randint(*sig_range)
+        if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
+        else: dmg = raw // 2 if s.p_defend else raw; outcome = "normal"
+        if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+        halved_tag = " *(halved)*" if s.p_defend and dmg > 0 else ""
+        if outcome == "miss": lines.append(f"💨 **{e['name']}** uses **{sig['name']}** — but it **MISSED**!")
+        elif outcome == "crit": lines.append(f"💥 **CRITICAL!** **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
+        else: lines.append(f"💥 **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
+        e_pts = max(0, e_pts - 6)
+
+    actions = []; att = 0
+    while e_pts > 0 and att < 20:
+        att += 1
+        affordable = [(k, m) for k, m in MOVES.items() if m["cost"] <= e_pts]
+        if not affordable: break
+        mk, m = random.choice(affordable)
+        if m["type"] == "atk":
+            slash_range = e["hard"]["slash_dmg"] if (s.hard_mode and mk == "slash") else (e["slash_dmg"] if mk == "slash" else m["dmg"])
+            raw = random.randint(*slash_range)
+            if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
+            else: dmg = raw // 2 if s.p_defend else raw; outcome = "normal"
+            if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+            tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
+            actions.append(f"**{mk.capitalize()}**{tag} ({dmg} dmg)")
+        elif m["type"] == "heal":
+            h = random.randint(*m["heal"]); s.e_hp = min(s.e_hp_max, s.e_hp + h); actions.append(f"**Cure** (+{h} HP)")
+        elif m["type"] == "status":
+            if m["effect"] == "poison" and s.p_poison == 0: s.p_poison = 3; actions.append("**Poison**")
+            elif m["effect"] == "regen" and s.e_regen == 0: s.e_regen = 3; actions.append("**Regen**")
+            else:
+                slash_range = e["hard"]["slash_dmg"] if s.hard_mode else e["slash_dmg"]
+                raw = random.randint(*slash_range)
+                if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
+                else: dmg = raw // 2 if s.p_defend else raw; outcome = "normal"
+                if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+                tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
+                actions.append(f"**Slash**{tag} ({dmg} dmg)")
+        e_pts -= m["cost"]
+    if actions: lines.append(f"👹 {e['name']} uses: " + ", ".join(actions))
+
+    if s.e_poison > 0: s.e_hp = max(0, s.e_hp - 3); s.e_poison -= 1; lines.append(f"☠ {e['name']} takes **3** poison damage!")
+    if s.e_regen  > 0:
+        h = random.randint(5, 10); s.e_hp = min(s.e_hp_max, s.e_hp + h); s.e_regen -= 1
+        lines.append(f"♻ {e['name']} regenerates **{h}** HP!")
+
+    s.p_defend = False
+    await channel.send("\n".join(lines))
+    await s.refresh_pins()
+
+    if s.p_hp <= 0:
+        await s.refresh_pins("💀 Defeated", "👹 Wins!")
+        await _end_pve_ui(channel, s, won=False); return
+    if s.e_hp <= 0:
+        await s.refresh_pins("🏆 Victory!", "💀 Defeated")
+        await _end_pve_ui(channel, s, won=True); return
+
+    await channel.send("Your turn! What will you do?", view=RollView(s))
+
+
+async def _end_pve_ui(channel: discord.TextChannel, s, won: bool):
+    uid = s.player.id
+    if won:
+        gil_bonus = GIL_WIN_PVE * 2 if s.hard_mode else GIL_WIN_PVE
+        await db_add_gil(uid, gil_bonus)
+        hard_unlocked_msg = ""
+        if not s.hard_mode:
+            enemy_key = next(k for k, v in ENEMIES.items() if v is s.enemy)
+            s.unlocked_hard = await db_get_hard_unlocked(uid)
+            if enemy_key not in s.unlocked_hard:
+                await db_unlock_hard(uid, enemy_key)
+                s.unlocked_hard.add(enemy_key)
+                hard_unlocked_msg = f"\n\n🔴 **HARD MODE UNLOCKED:** {s.enemy['name']} (Hard)!"
+        mode_tag = " *(Hard Mode)*" if s.hard_mode else ""
+        new_bal = await db_get_gil(uid)
+        em = discord.Embed(title="🏆 VICTORY!",
+            description=f"**Congratulations, {s.char_name}!**{mode_tag}\n\n{random.choice(WIN_MSGS)}\n\n💰 +{gil_bonus} gil! Balance: **{new_bal} gil**{hard_unlocked_msg}",
+            color=0x50e090)
+    else:
+        lose_bal = await db_get_gil(uid)
+        em = discord.Embed(title="💀 DEFEATED",
+            description=f"**{random.choice(LOSE_MSGS)}**\n\n💰 Balance: **{lose_bal} gil**",
+            color=0xe05050)
+    await _reset_battle_state(s)
+    s.unlocked_hard = await db_get_hard_unlocked(uid)
+    await channel.send(embed=em, view=FightMenuView(s))
+
+
+async def _end_duel_ui(channel: discord.TextChannel, duel, winner_side: str):
+    duel.active = False
+    winner = duel.challenger if winner_side == "challenger" else duel.opponent
+    loser  = duel.opponent   if winner_side == "challenger" else duel.challenger
+    w_name = duel.c_name     if winner_side == "challenger" else duel.o_name
+    l_name = duel.o_name     if winner_side == "challenger" else duel.c_name
+    await db_add_gil(winner.id,  GIL_WIN_DUEL)
+    await db_add_gil(loser.id,  -GIL_LOSE_DUEL)
+    winner_bal = await db_get_gil(winner.id)
+    loser_bal  = await db_get_gil(loser.id)
+    em = discord.Embed(title="🏆 DUEL OVER!",
+        description=(
+            f"**{w_name}** defeats **{l_name}**!\n\n"
+            f"💰 {winner.mention} gains **{GIL_WIN_DUEL} gil** → Balance: **{winner_bal} gil**\n"
+            f"💸 {loser.mention} loses **{GIL_LOSE_DUEL} gil** → Balance: **{loser_bal} gil**"
+        ), color=0xf0d060)
+    await channel.send(embed=em)
+    try: await duel.channel.set_permissions(duel.opponent, overwrite=None)
+    except Exception: pass
+    if channel.id in active_duels:
+        del active_duels[channel.id]
+
+
+async def _reset_battle_state(s):
+    s.enemy = None; s.e_hp = s.e_hp_max = 0
+    s.e_poison = s.e_regen = 0
+    s.p_hp = s.p_hp_max
+    s.p_poison = s.p_regen = s.stored = s.pts_left = s.pts_total = 0
+    s.p_defend = False; s.queue = []; s.hard_mode = False
+    s.phase = "select_enemy"; s.pinned_player = None; s.pinned_enemy = None
+
 # ─────────────────────────────────────────────
 #  BOT SETUP
 # ─────────────────────────────────────────────
@@ -901,8 +1277,8 @@ async def duel_accept(ctx: commands.Context, challenger: discord.Member):
 
     await c_channel.send(
         f"💰 Stakes: Winner **+{GIL_WIN_DUEL} gil** | Loser **-{GIL_LOSE_DUEL} gil**\n"
-        f"{duel.challenger.mention} goes first — pick one move:\n"
-        f"`!slash` `!fire` `!ice` `!thunder` `!poison` `!regen` `!cure`"
+        f"{duel.challenger.mention} goes first — pick your move:",
+        view=DuelMoveView(duel, c_channel)
     )
     await ctx.send(f"✅ Duel accepted! Head to {c_channel.mention} to fight!")
 
@@ -1082,12 +1458,13 @@ async def stop_battle(ctx: commands.Context):
     s.pinned_player = None
     s.pinned_enemy  = None
 
+    s.unlocked_hard = await db_get_hard_unlocked(ctx.author.id)
     em = discord.Embed(
         title="⚔ Battle Stopped",
-        description="Returning to enemy select. Type `!fight` to choose your next opponent.",
+        description="Returning to enemy select. Press a button to choose your next opponent.",
         color=0x2a55c0,
     )
-    await ctx.send(embed=em)
+    await ctx.send(embed=em, view=FightMenuView(s))
 
 
 # ─────────────────────────────────────────────
