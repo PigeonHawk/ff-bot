@@ -1,8 +1,9 @@
-   import discord
+ import discord
 from discord.ext import commands
 import random
 import asyncio
 import os
+import asyncpg
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -111,11 +112,85 @@ GIL_LOSE_DUEL = 10
 GIL_START     = 200
 
 # ─────────────────────────────────────────────
-#  GIL BANK
+#  DATABASE  (Railway PostgreSQL)
+#  Connected via DATABASE_URL env var set automatically by Railway.
+#  Tables created on startup if they don't exist.
+# ─────────────────────────────────────────────
+db_pool = None   # set in on_ready
+
+async def init_db():
+    global db_pool
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("⚠️  No DATABASE_URL found — player data will not persist.")
+        return
+    db_pool = await asyncpg.create_pool(db_url)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS players (
+                user_id     BIGINT PRIMARY KEY,
+                gil         INTEGER NOT NULL DEFAULT 200,
+                hard_unlocked TEXT NOT NULL DEFAULT ''
+            )
+        """)
+    print("✅ Database connected and tables ready.")
+
+async def db_ensure(uid: int):
+    """Insert a player row if it doesn't exist yet."""
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO players (user_id, gil) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            uid, GIL_START,
+        )
+
+async def db_get_gil(uid: int) -> int:
+    if not db_pool: return GIL_START
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT gil FROM players WHERE user_id=$1", uid)
+        return row["gil"] if row else GIL_START
+
+async def db_add_gil(uid: int, amt: int):
+    if not db_pool: return
+    await db_ensure(uid)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE players SET gil = GREATEST(0, gil + $1) WHERE user_id=$2",
+            amt, uid,
+        )
+
+async def db_set_gil(uid: int, amt: int):
+    if not db_pool: return
+    await db_ensure(uid)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE players SET gil = GREATEST(0, $1) WHERE user_id=$2",
+            amt, uid,
+        )
+
+async def db_get_hard_unlocked(uid: int) -> set:
+    if not db_pool: return set()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT hard_unlocked FROM players WHERE user_id=$1", uid)
+        if not row or not row["hard_unlocked"]: return set()
+        return set(row["hard_unlocked"].split(","))
+
+async def db_unlock_hard(uid: int, enemy_key: str):
+    if not db_pool: return
+    unlocked = await db_get_hard_unlocked(uid)
+    unlocked.add(enemy_key)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE players SET hard_unlocked=$1 WHERE user_id=$2",
+            ",".join(unlocked), uid,
+        )
+
+# ─────────────────────────────────────────────
+#  IN-MEMORY GIL CACHE (fallback if no DB)
 # ─────────────────────────────────────────────
 gil_bank: dict[int, int] = {}
-def get_gil(uid):       return gil_bank.get(uid, 0)
-def add_gil(uid, amt):  gil_bank[uid] = max(0, gil_bank.get(uid, 0) + amt)
+def get_gil(uid):       return gil_bank.get(uid, GIL_START)
+def add_gil(uid, amt):  gil_bank[uid] = max(0, gil_bank.get(uid, GIL_START) + amt)
 def set_gil(uid, amt):  gil_bank[uid] = max(0, amt)
 
 # ─────────────────────────────────────────────
@@ -430,8 +505,7 @@ async def start_ff(ctx: commands.Context):
         topic=f"Final Fantasy RPG — {ctx.author.display_name}'s adventure",
     )
     player_channels[ctx.author.id] = game_channel.id
-    if ctx.author.id not in gil_bank:
-        set_gil(ctx.author.id, GIL_START)
+    await db_ensure(ctx.author.id)
     await ctx.send(f"✨ {ctx.author.mention} Your adventure awaits: {game_channel.mention}")
     await _send_class_select(game_channel)
 
@@ -485,7 +559,7 @@ async def set_zodiac(ctx: commands.Context, *, month: str):
     em.add_field(name="Name",   value=s.char_name,              inline=True)
     em.add_field(name="Class",  value=s.chosen_class["name"],   inline=True)
     em.add_field(name="Zodiac", value=s.zodiac,                 inline=True)
-    em.add_field(name="Gil",    value=f"💰 {get_gil(ctx.author.id)} gil", inline=True)
+    em.add_field(name="Gil",    value=f"💰 {await db_get_gil(ctx.author.id)} gil", inline=True)
     em.set_footer(text="!fight to battle  |  !ffduel @user to challenge  |  !gil for balance")
     await ctx.send(embed=em)
 
@@ -741,8 +815,9 @@ async def _end_pve(ctx: commands.Context, s: GameSession, won: bool):
             color=0x50e090)
         em.set_footer(text="!fight to see all opponents  |  !ffduel @user to challenge someone")
     else:
+        lose_bal = await db_get_gil(ctx.author.id)
         em = discord.Embed(title="💀 DEFEATED",
-            description=f"**{random.choice(LOSE_MSGS)}**\n\n💰 Balance: **{get_gil(ctx.author.id)} gil**",
+            description=f"**{random.choice(LOSE_MSGS)}**\n\n💰 Balance: **{lose_bal} gil**",
             color=0xe05050)
         em.set_footer(text="!fight to try again.")
     await ctx.send(embed=em)
@@ -877,14 +952,16 @@ async def _end_duel(ctx: commands.Context, duel: DuelSession, winner_side: str):
     w_name = duel.c_name     if winner_side == "challenger" else duel.o_name
     l_name = duel.o_name     if winner_side == "challenger" else duel.c_name
 
-    add_gil(winner.id,  GIL_WIN_DUEL)
-    add_gil(loser.id,  -GIL_LOSE_DUEL)
+    await db_add_gil(winner.id,  GIL_WIN_DUEL)
+    await db_add_gil(loser.id,  -GIL_LOSE_DUEL)
+    winner_bal = await db_get_gil(winner.id)
+    loser_bal  = await db_get_gil(loser.id)
 
     em = discord.Embed(title="🏆 DUEL OVER!",
         description=(
             f"**{w_name}** defeats **{l_name}**!\n\n"
-            f"💰 {winner.mention} gains **{GIL_WIN_DUEL} gil** → Balance: **{get_gil(winner.id)} gil**\n"
-            f"💸 {loser.mention} loses **{GIL_LOSE_DUEL} gil** → Balance: **{get_gil(loser.id)} gil**"
+            f"💰 {winner.mention} gains **{GIL_WIN_DUEL} gil** → Balance: **{winner_bal} gil**\n"
+            f"💸 {loser.mention} loses **{GIL_LOSE_DUEL} gil** → Balance: **{loser_bal} gil**"
         ), color=0xf0d060)
     await ctx.send(embed=em)
 
@@ -931,8 +1008,9 @@ async def show_gil(ctx: commands.Context):
     if not _is_game_channel(ctx): return
     s    = active_sessions.get(ctx.channel.id)
     name = s.char_name if s else ctx.author.display_name
+    bal  = await db_get_gil(ctx.author.id)
     em   = discord.Embed(title="💰 Gil Balance",
-        description=f"**{name}** has **{get_gil(ctx.author.id)} gil**", color=0xf0d060)
+        description=f"**{name}** has **{bal} gil**", color=0xf0d060)
     em.set_footer(text=f"PvE win: +{GIL_WIN_PVE} gil  |  Duel win: +{GIL_WIN_DUEL} gil  |  Duel loss: -{GIL_LOSE_DUEL} gil")
     await ctx.send(embed=em)
 
@@ -1001,6 +1079,8 @@ def _get_pve(ctx: commands.Context) -> GameSession | None:
 
 @bot.event
 async def on_ready():
+    await init_db()
     print(f"✅ {bot.user} is online and ready!")
 
 bot.run(BOT_TOKEN)
+
