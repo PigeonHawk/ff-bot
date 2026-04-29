@@ -449,7 +449,67 @@ async def run_enemy_turn(channel, s: GameSession):
         await s.refresh_pins("🏆 Victory!", "💀 Defeated")
         await end_pve(channel, s, won=True); return
 
-    await channel.send("Your turn! What will you do?", view=RollView(s))
+    await channel.send("Your turn! What will you do?", view=RollAgainView(s))
+
+
+class RollAgainView(discord.ui.View):
+    """Sent after enemy turn completes — Roll Again | Status | Stop."""
+    def __init__(self, session: GameSession):
+        super().__init__(timeout=300)
+        self.session = session
+
+    @discord.ui.button(label="🎲 Roll Again", style=discord.ButtonStyle.primary, row=0)
+    async def roll_again_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        base  = random.randint(1, 6); total = base + s.stored; s.stored = 0
+        s.pts_left = s.pts_total = total
+        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+        note  = f" (+{total - base} stored) = **{total}**" if total > base else ""
+        self.stop()
+        await interaction.response.send_message(
+            f"{faces[base-1]} **{interaction.user.display_name}** rolled **{base}**{note}!\n**{s.pts_left}pt** to spend — pick your moves:",
+            view=MoveView(s)
+        )
+        await s.refresh_pins()
+
+    @discord.ui.button(label="🛡 Defend  (store roll + halve damage)", style=discord.ButtonStyle.secondary, row=0)
+    async def defend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        base = random.randint(1, 6); s.stored += base; s.p_defend = True
+        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+        self.stop()
+        await interaction.response.send_message(
+            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Damage halved this turn.\n"
+            f"📦 Stored roll: **{s.stored}pt** carries into your next dice roll."
+        )
+        await s.refresh_pins()
+        await run_enemy_turn(interaction.channel, s)
+
+    @discord.ui.button(label="📊 Status", style=discord.ButtonStyle.secondary, row=0)
+    async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.send_message(
+            embeds=[pve_player_card(s), pve_enemy_card(s)],
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="🛑 Stop Battle", style=discord.ButtonStyle.danger, row=1)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        self.stop()
+        s.phase = "select_enemy"; s.enemy = None; s.queue = []; s.pinned_player = None; s.pinned_enemy = None
+        s.unlocked_hard = await db_get_hard_unlocked(interaction.user.id)
+        em = discord.Embed(title="⚔ Battle Stopped", description="Choose your next opponent.", color=0x2a55c0)
+        await interaction.response.send_message(embed=em, view=FightMenuView(s))
+
 
 async def end_pve(channel, s: GameSession, won: bool):
     uid = s.player.id
@@ -535,11 +595,12 @@ class FightMenuView(discord.ui.View):
 
 
 class RollView(discord.ui.View):
+    """Row 1: Roll | Defend | Status   Row 2: Stop"""
     def __init__(self, session: GameSession):
         super().__init__(timeout=300)
         self.session = session
 
-    @discord.ui.button(label="🎲 Roll Dice", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🎲 Roll Dice", style=discord.ButtonStyle.primary, row=0)
     async def roll_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = self.session
         if interaction.user.id != s.player.id:
@@ -555,7 +616,7 @@ class RollView(discord.ui.View):
         )
         await s.refresh_pins()
 
-    @discord.ui.button(label="🛡 Defend", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="🛡 Defend  (store roll + halve damage)", style=discord.ButtonStyle.secondary, row=0)
     async def defend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = self.session
         if interaction.user.id != s.player.id:
@@ -564,12 +625,23 @@ class RollView(discord.ui.View):
         faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
         self.stop()
         await interaction.response.send_message(
-            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Damage halved this turn."
+            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Incoming damage halved this turn.\n"
+            f"📦 Stored roll: **{s.stored}pt** carries into your next dice roll."
         )
         await s.refresh_pins()
         await run_enemy_turn(interaction.channel, s)
 
-    @discord.ui.button(label="🛑 Stop Battle", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="📊 Status", style=discord.ButtonStyle.secondary, row=0)
+    async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.send_message(
+            embeds=[pve_player_card(s), pve_enemy_card(s)],
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="🛑 Stop Battle", style=discord.ButtonStyle.danger, row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = self.session
         if interaction.user.id != s.player.id:
@@ -600,18 +672,31 @@ class MoveView(discord.ui.View):
     def _rebuild(self):
         self.clear_items()
         s = self.session
-        for label, key, style, cost in self.MOVE_DEFS:
-            btn = discord.ui.Button(label=label, style=style, disabled=s.pts_left < cost, custom_id=f"mv_{key}")
+        # Row 0 + 1: move buttons (max 5 per row)
+        for i, (label, key, style, cost) in enumerate(self.MOVE_DEFS):
+            row = 0 if i < 4 else 1
+            btn = discord.ui.Button(label=label, style=style, disabled=s.pts_left < cost, custom_id=f"mv_{key}", row=row)
             btn.callback = self._make_move_cb(key, cost)
             self.add_item(btn)
+        # Row 2: Execute | Status | Roll Again
         exec_btn = discord.ui.Button(
             label=f"✅ Execute ({len(s.queue)} queued)" if s.queue else "✅ Execute",
             style=discord.ButtonStyle.primary,
             disabled=not s.queue,
-            custom_id="mv_execute"
+            custom_id="mv_execute",
+            row=2
         )
         exec_btn.callback = self._execute_cb
         self.add_item(exec_btn)
+
+        status_btn = discord.ui.Button(
+            label="📊 Status",
+            style=discord.ButtonStyle.secondary,
+            custom_id="mv_status",
+            row=2
+        )
+        status_btn.callback = self._status_cb
+        self.add_item(status_btn)
 
     def _make_move_cb(self, key, cost):
         async def cb(interaction: discord.Interaction):
@@ -629,6 +714,15 @@ class MoveView(discord.ui.View):
                 view=self
             )
         return cb
+
+    async def _status_cb(self, interaction: discord.Interaction):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.send_message(
+            embeds=[pve_player_card(s), pve_enemy_card(s)],
+            ephemeral=True
+        )
 
     async def _execute_cb(self, interaction: discord.Interaction):
         s = self.session
