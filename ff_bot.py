@@ -1,4 +1,4 @@
-import discord
+   import discord
 from discord.ext import commands
 import random
 import asyncio
@@ -8,7 +8,7 @@ import os
 #  CONFIG
 # ─────────────────────────────────────────────
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ASSET_BASE_URL = "https://raw.githubusercontent.com/PigeonHawk/ff-bot/main/"
+ASSET_BASE_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/assets/"
 FF_CATEGORY_ID = 1498963161934467184
 
 # ─────────────────────────────────────────────
@@ -934,6 +934,39 @@ async def show_gil(ctx: commands.Context):
     em   = discord.Embed(title="💰 Gil Balance",
         description=f"**{name}** has **{get_gil(ctx.author.id)} gil**", color=0xf0d060)
     em.set_footer(text=f"PvE win: +{GIL_WIN_PVE} gil  |  Duel win: +{GIL_WIN_DUEL} gil  |  Duel loss: -{GIL_LOSE_DUEL} gil")
+    await ctx.send(embed=em)
+
+
+# ─────────────────────────────────────────────
+#  !stop — abort current PvE battle, return to enemy select
+# ─────────────────────────────────────────────
+@bot.command(name="stop")
+async def stop_battle(ctx: commands.Context):
+    if not _is_game_channel(ctx): return
+    s = active_sessions.get(ctx.channel.id)
+    if not s:
+        await ctx.send("No active session found."); return
+    if ctx.author.id != s.player.id:
+        await ctx.send("Only the channel owner can stop the battle."); return
+
+    # Reset all battle state cleanly
+    s.enemy        = None
+    s.e_hp         = s.e_hp_max = 0
+    s.e_poison     = s.e_regen = 0
+    s.p_hp         = s.p_hp_max
+    s.p_poison     = s.p_regen = s.stored = s.pts_left = s.pts_total = 0
+    s.p_defend     = False
+    s.queue        = []
+    s.hard_mode    = False
+    s.phase        = "select_enemy"
+    s.pinned_player = None
+    s.pinned_enemy  = None
+
+    em = discord.Embed(
+        title="⚔ Battle Stopped",
+        description="Returning to enemy select. Type `!fight` to choose your next opponent.",
+        color=0x2a55c0,
+    )
     await ctx.send(embed=em)
 
 
