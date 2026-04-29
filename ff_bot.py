@@ -36,34 +36,6 @@ ENEMIES = {
                   "hard": {"hp": 540, "slash_dmg": (11, 21), "sig_dmg": (30, 48)}},
 }
 
-# Hard mode versions — unlocked after defeating the normal version
-# +50% HP, +25% damage ranges, signature moves hit harder, sig threshold raised to 40%
-HARD_ENEMIES = {
-    "garland+":   {"name": "Garland ☆",         "hp": 430, "gif": "unit_201000203_1idle_opac.gif",
-                   "sig": {"name": "Chaos Slicer+", "dmg": (26, 40)}, "slash_dmg": (9, 20),
-                   "sig_threshold": 0.4},
-    "sephiroth+": {"name": "Sephiroth ☆",        "hp": 490, "gif": "unit_335000305_1idle_opac.gif",
-                   "sig": {"name": "Octoslash+",    "dmg": (32, 50)}, "slash_dmg": (10, 22),
-                   "sig_threshold": 0.4},
-    "cod+":       {"name": "Cloud of Darkness ☆", "hp": 530, "gif": "unit_203000803_1idle_opac.gif",
-                   "sig": {"name": "Aura Ball+",    "dmg": (29, 46)}, "slash_dmg": (9, 19),
-                   "sig_threshold": 0.4},
-}
-
-# Merge so all battle logic can look up either dict by key
-ALL_ENEMIES = {**ENEMIES, **HARD_ENEMIES}
-
-# Per-player set of unlocked hard bosses  {user_id: {"garland+", ...}}
-unlocked_hard: dict[int, set] = {}
-
-def unlock_hard(user_id: int, normal_key: str):
-    hard_key = normal_key + "+"
-    if hard_key in HARD_ENEMIES:
-        unlocked_hard.setdefault(user_id, set()).add(hard_key)
-
-def is_unlocked(user_id: int, hard_key: str) -> bool:
-    return hard_key in unlocked_hard.get(user_id, set())
-
 MOVES = {
     "slash":   {"cost": 1, "type": "atk",    "dmg": (4,  10)},
     "poison":  {"cost": 3, "type": "status", "effect": "poison"},
@@ -93,7 +65,7 @@ ZODIAC_MAP = {
     "November":  "Scorpio ♏",    "December":  "Sagittarius ♐",
 }
 
-WIN_MSGS  = [
+WIN_MSGS = [
     "The crystal glows in your honor! You are a true champion.",
     "A legend is born this day. Well fought, warrior.",
     "The darkness retreats before your light. Victory is yours!",
@@ -110,33 +82,32 @@ GIL_WIN_PVE   = 10
 GIL_WIN_DUEL  = 20
 GIL_LOSE_DUEL = 10
 GIL_START     = 200
+MISS_CHANCE   = 0.15
+CRIT_CHANCE   = 0.15
 
 # ─────────────────────────────────────────────
-#  DATABASE  (Railway PostgreSQL)
-#  Connected via DATABASE_URL env var set automatically by Railway.
-#  Tables created on startup if they don't exist.
+#  DATABASE
 # ─────────────────────────────────────────────
-db_pool = None   # set in on_ready
+db_pool = None
 
 async def init_db():
     global db_pool
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
-        print("⚠️  No DATABASE_URL found — player data will not persist.")
+        print("WARNING: No DATABASE_URL — data will not persist.")
         return
     db_pool = await asyncpg.create_pool(db_url)
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS players (
-                user_id     BIGINT PRIMARY KEY,
-                gil         INTEGER NOT NULL DEFAULT 200,
+                user_id      BIGINT PRIMARY KEY,
+                gil          INTEGER NOT NULL DEFAULT 200,
                 hard_unlocked TEXT NOT NULL DEFAULT ''
             )
         """)
-    print("✅ Database connected and tables ready.")
+    print("Database connected and tables ready.")
 
 async def db_ensure(uid: int):
-    """Insert a player row if it doesn't exist yet."""
     if not db_pool: return
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -155,18 +126,7 @@ async def db_add_gil(uid: int, amt: int):
     await db_ensure(uid)
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE players SET gil = GREATEST(0, gil + $1) WHERE user_id=$2",
-            amt, uid,
-        )
-
-async def db_set_gil(uid: int, amt: int):
-    if not db_pool: return
-    await db_ensure(uid)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE players SET gil = GREATEST(0, $1) WHERE user_id=$2",
-            amt, uid,
-        )
+            "UPDATE players SET gil = GREATEST(0, gil + $1) WHERE user_id=$2", amt, uid)
 
 async def db_get_hard_unlocked(uid: int) -> set:
     if not db_pool: return set()
@@ -182,19 +142,10 @@ async def db_unlock_hard(uid: int, enemy_key: str):
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE players SET hard_unlocked=$1 WHERE user_id=$2",
-            ",".join(unlocked), uid,
-        )
+            ",".join(unlocked), uid)
 
 # ─────────────────────────────────────────────
-#  IN-MEMORY GIL CACHE (fallback if no DB)
-# ─────────────────────────────────────────────
-gil_bank: dict[int, int] = {}
-def get_gil(uid):       return gil_bank.get(uid, GIL_START)
-def add_gil(uid, amt):  gil_bank[uid] = max(0, gil_bank.get(uid, GIL_START) + amt)
-def set_gil(uid, amt):  gil_bank[uid] = max(0, amt)
-
-# ─────────────────────────────────────────────
-#  SHARED HELPERS
+#  HELPERS
 # ─────────────────────────────────────────────
 def hp_bar(cur, mx, n=16) -> str:
     f = round((cur / mx) * n)
@@ -208,216 +159,155 @@ async def edit_pin(msg: discord.Message, embed: discord.Embed):
     try: await msg.edit(embed=embed)
     except Exception: pass
 
-# ─────────────────────────────────────────────
-#  MISS / CRIT SYSTEM
-#  Miss  : 15%  → 0 damage
-#  Crit  : 15%  → 2× damage
-#  Normal: 70%
-# ─────────────────────────────────────────────
-MISS_CHANCE = 0.15
-CRIT_CHANCE = 0.15
-
-def calc_hit(base_dmg: int, halved: bool = False) -> tuple[int, str]:
+def calc_hit(base_dmg: int, halved: bool = False):
     roll = random.random()
     if roll < MISS_CHANCE:
         return 0, "miss"
     dmg = base_dmg * 2 if roll >= (1 - CRIT_CHANCE) else base_dmg
-    if halved:
-        dmg = dmg // 2
+    if halved: dmg = dmg // 2
     outcome = "crit" if roll >= (1 - CRIT_CHANCE) else "normal"
     return dmg, outcome
 
-def hit_line(move_name: str, atk: str, def_: str, outcome: str, dmg: int) -> str:
+def hit_line(move_name, atk, def_, outcome, dmg) -> str:
     if outcome == "miss":
         return f"💨 **{atk}** uses **{move_name}** — **MISSED** {def_}!"
     if outcome == "crit":
         return f"💥 **CRITICAL HIT!** **{atk}** lands **{move_name}** on {def_} for **{dmg}** damage!"
     return f"⚔ **{atk}** uses **{move_name}** on {def_} for **{dmg}** damage!"
 
-
 # ─────────────────────────────────────────────
-#  PvE CARD BUILDERS
-#  Two separate embeds — player card + enemy card
-#  Each shows its GIF large via set_image so both
-#  sprites are fully visible and animated.
+#  CARD BUILDERS
 # ─────────────────────────────────────────────
-def pve_player_card(s, title: str = "") -> discord.Embed:
-    """Blue card — player sprite + HP + status + queue info."""
+def pve_player_card(s, title="") -> discord.Embed:
     status_parts = []
     if s.p_poison: status_parts.append(f"☠ Poison ({s.p_poison} turns)")
     if s.p_regen:  status_parts.append(f"♻ Regen ({s.p_regen} turns)")
-    if s.p_defend: status_parts.append("🛡 Defending  *(damage halved)*")
-    if s.stored:   status_parts.append(f"📦 Stored roll: +{s.stored}pt")
+    if s.p_defend: status_parts.append("🛡 Defending")
+    if s.stored:   status_parts.append(f"📦 Stored +{s.stored}pt")
     status_val = "\n".join(status_parts) if status_parts else "—"
-
-    pts_val = f"**{s.pts_left}pt** remaining" if s.pts_left else "—"
-    queue_val = " → ".join(q.capitalize() for q in s.queue) if s.queue else "—"
-
-    em = discord.Embed(
-        title=title or f"⚔ {s.char_name}",
-        color=0x1a3a8a,
-    )
+    pts_line   = f"\n\n🎲 **{s.pts_left}pt** remaining" if s.pts_left else ""
+    queue_line = f"\n📋 **{' → '.join(q.capitalize() for q in s.queue)}**" if s.queue else ""
+    em = discord.Embed(title=title or f"⚔ {s.char_name}", color=0x1a3a8a)
     em.set_author(name=f"{s.char_name}  ·  {s.chosen_class['name']}  ·  {s.chosen_class['role']}")
     em.set_image(url=ASSET_BASE_URL + s.chosen_class["gif"])
-    em.add_field(
-        name="HP",
-        value=f"`{hp_bar(s.p_hp, s.p_hp_max_battle)}`\n**{s.p_hp} / {s.p_hp_max_battle}**",
-        inline=True,
-    )
-    em.add_field(name="Status",        value=status_val, inline=True)
-    em.add_field(name="Points / Queue",value=f"{pts_val}\n{queue_val}", inline=False)
-    em.set_footer(text="!roll → queue moves → !execute  |  !defend to store roll & halve damage")
+    em.add_field(name="HP", value=f"`{hp_bar(s.p_hp, s.p_hp_max)}`\n**{s.p_hp} / {s.p_hp_max}**", inline=True)
+    em.add_field(name="Status", value=status_val + pts_line + queue_line, inline=True)
+    em.set_footer(text="Buttons below — Roll dice, pick moves, then Execute")
     return em
 
-
-def pve_enemy_card(s, title: str = "") -> discord.Embed:
-    """Red card — enemy sprite + HP + status + sig warning."""
+def pve_enemy_card(s, title="") -> discord.Embed:
     e = s.enemy
     status_parts = []
     if s.e_poison: status_parts.append(f"☠ Poison ({s.e_poison} turns)")
     if s.e_regen:  status_parts.append(f"♻ Regen ({s.e_regen} turns)")
     status_val = "\n".join(status_parts) if status_parts else "—"
     low_warn = "\n\n⚠️ **Signature move ready!**" if s.e_hp > 0 and s.e_hp / s.e_hp_max < 0.3 else ""
-
-    em = discord.Embed(
-        title=title or f"👹 {e['name']}",
-        color=0x8b0000,
-    )
+    em = discord.Embed(title=title or f"👹 {e['name']}", color=0x8b0000)
     em.set_author(name=f"{e['name']}  ·  Signature: {e['sig']['name']}")
     em.set_image(url=ASSET_BASE_URL + e["gif"])
-    em.add_field(
-        name="HP",
-        value=f"`{hp_bar(s.e_hp, s.e_hp_max)}`\n**{s.e_hp} / {s.e_hp_max}**",
-        inline=True,
-    )
+    em.add_field(name="HP", value=f"`{hp_bar(s.e_hp, s.e_hp_max)}`\n**{s.e_hp} / {s.e_hp_max}**", inline=True)
     em.add_field(name="Status", value=status_val + low_warn, inline=True)
-    em.set_footer(text=f"Signature activates below 30% HP")
+    em.set_footer(text="Signature activates below 30% HP")
     return em
 
-
-# ─────────────────────────────────────────────
-#  DUEL CARD BUILDERS
-# ─────────────────────────────────────────────
-def duel_card(name, class_name, gif, hp, hp_max, poison, regen, color, whose_turn: str, is_this_player: bool, footer="") -> discord.Embed:
-    """One card per duelist — GIF shown large via set_image."""
+def duel_card(name, class_name, gif, hp, hp_max, poison, regen, color, is_turn) -> discord.Embed:
     status_parts = []
     if poison: status_parts.append(f"☠ Poison ({poison} turns)")
     if regen:  status_parts.append(f"♻ Regen ({regen} turns)")
     status_val = "\n".join(status_parts) if status_parts else "—"
-
-    turn_tag = "  🟢 YOUR TURN" if is_this_player else ""
-
+    turn_tag = "  🟢 YOUR TURN" if is_turn else ""
     em = discord.Embed(color=color)
     em.set_author(name=f"{name}  ·  {class_name}{turn_tag}")
     em.set_image(url=ASSET_BASE_URL + gif)
-    em.add_field(
-        name="HP",
-        value=f"`{hp_bar(hp, hp_max)}`\n**{hp} / {hp_max}**",
-        inline=True,
-    )
+    em.add_field(name="HP", value=f"`{hp_bar(hp, hp_max)}`\n**{hp} / {hp_max}**", inline=True)
     em.add_field(name="Status", value=status_val, inline=True)
-    if footer:
-        em.set_footer(text=footer)
     return em
-
 
 # ─────────────────────────────────────────────
 #  PvE SESSION
 # ─────────────────────────────────────────────
 class GameSession:
-    def __init__(self, player: discord.Member, chosen_class: dict, char_name: str, zodiac: str):
-        self.player       = player
-        self.chosen_class = chosen_class
-        self.char_name    = char_name
-        self.zodiac       = zodiac
-        self.p_hp_max     = chosen_class["hp"]
-        self.p_hp         = self.p_hp_max
+    def __init__(self, player, chosen_class, char_name, zodiac):
+        self.player        = player
+        self.chosen_class  = chosen_class
+        self.char_name     = char_name
+        self.zodiac        = zodiac
+        self.p_hp_max      = chosen_class["hp"]
+        self.p_hp          = self.p_hp_max
         self.p_poison = self.p_regen = self.stored = self.pts_left = self.pts_total = 0
-        self.p_defend     = False
-        self.enemy        = None
+        self.p_defend      = False
+        self.enemy         = None
         self.e_hp_max = self.e_hp = 0
         self.e_poison = self.e_regen = 0
-        self.phase        = "select_enemy"
-        self.queue: list  = []
-        self.hard_mode: bool = False
-        self.p_hp_max_battle: int = self.p_hp_max   # may be boosted in hard mode
-        self.pinned_player: discord.Message | None = None   # player card pin
-        self.pinned_enemy:  discord.Message | None = None   # enemy card pin
+        self.hard_mode     = False
+        self.unlocked_hard = set()
+        self.queue         = []
+        self.phase         = "select_enemy"
+        self.pinned_player = None
+        self.pinned_enemy  = None
 
-    def reset_for_battle(self, enemy_key: str, hard_mode: bool = False):
-        e = ALL_ENEMIES[enemy_key]
-        self.enemy     = e;  self.e_hp_max = e["hp"]; self.e_hp = self.e_hp_max
+    def reset_for_battle(self, enemy_key, hard=False):
+        e = ENEMIES[enemy_key]
+        self.enemy     = e
+        self.hard_mode = hard
+        self.e_hp_max  = e["hard"]["hp"] if hard else e["hp"]
+        self.e_hp      = self.e_hp_max
         self.e_poison  = self.e_regen = 0
-        self.hard_mode = hard_mode
-        # +100 HP bonus for hard mode battles
-        bonus          = 100 if hard_mode else 0
-        self.p_hp_max_battle = self.p_hp_max + bonus
-        self.p_hp      = self.p_hp_max_battle
+        self.p_hp_max  = self.chosen_class["hp"] + (50 if hard else 0)
+        self.p_hp      = self.p_hp_max
         self.p_poison  = self.p_regen = self.stored = 0
-        self.p_defend  = False;  self.phase = "rolled";  self.queue = []
-        self.pinned_player = None;  self.pinned_enemy = None
+        self.p_defend  = False
+        self.queue     = []
+        self.phase     = "battle"
+        self.pinned_player = None
+        self.pinned_enemy  = None
 
     async def refresh_pins(self, p_title="", e_title=""):
         if self.pinned_player:
             await edit_pin(self.pinned_player, pve_player_card(self, p_title))
         if self.pinned_enemy:
-            await edit_pin(self.pinned_enemy,  pve_enemy_card(self, e_title))
-
+            await edit_pin(self.pinned_enemy, pve_enemy_card(self, e_title))
 
 # ─────────────────────────────────────────────
 #  DUEL SESSION
 # ─────────────────────────────────────────────
 class DuelSession:
-    def __init__(self, challenger: discord.Member, opponent: discord.Member,
-                 cs: GameSession, os_: GameSession, channel: discord.TextChannel):
+    def __init__(self, challenger, opponent, cs, os_, channel):
         self.challenger = challenger
         self.opponent   = opponent
         self.channel    = channel
-
         self.c_hp_max   = 400;  self.c_hp = self.c_hp_max
         self.c_poison   = self.c_regen = 0
         self.c_name     = cs.char_name;  self.c_class = cs.chosen_class["name"]
         self.c_gif      = cs.chosen_class["gif"]
-
         self.o_hp_max   = 400;  self.o_hp = self.o_hp_max
         self.o_poison   = self.o_regen = 0
         self.o_name     = os_.char_name; self.o_class = os_.chosen_class["name"]
         self.o_gif      = os_.chosen_class["gif"]
-
         self.turn       = "challenger"
         self.active     = True
-        self.pinned_c:  discord.Message | None = None   # challenger card pin
-        self.pinned_o:  discord.Message | None = None   # opponent card pin
+        self.pinned_c   = None
+        self.pinned_o   = None
 
-    def current_player(self) -> discord.Member:
+    def current_player(self):
         return self.challenger if self.turn == "challenger" else self.opponent
 
     def swap_turn(self):
         self.turn = "opponent" if self.turn == "challenger" else "challenger"
 
-    def c_card(self, title="") -> discord.Embed:
-        is_turn = self.turn == "challenger"
-        footer  = "Pick one move: !slash !fire !ice !thunder !poison !regen !cure" if is_turn else ""
-        return duel_card(
-            self.c_name, self.c_class, self.c_gif,
-            self.c_hp, self.c_hp_max, self.c_poison, self.c_regen,
-            color=0x1a3a8a, whose_turn=self.turn, is_this_player=is_turn, footer=footer,
-        )
-
-    def o_card(self, title="") -> discord.Embed:
-        is_turn = self.turn == "opponent"
-        footer  = "Pick one move: !slash !fire !ice !thunder !poison !regen !cure" if is_turn else ""
-        return duel_card(
-            self.o_name, self.o_class, self.o_gif,
-            self.o_hp, self.o_hp_max, self.o_poison, self.o_regen,
-            color=0x8b0000, whose_turn=self.turn, is_this_player=is_turn, footer=footer,
-        )
-
     async def refresh_pins(self):
-        if self.pinned_c: await edit_pin(self.pinned_c, self.c_card())
-        if self.pinned_o: await edit_pin(self.pinned_o, self.o_card())
+        if self.pinned_c:
+            await edit_pin(self.pinned_c, duel_card(
+                self.c_name, self.c_class, self.c_gif,
+                self.c_hp, self.c_hp_max, self.c_poison, self.c_regen,
+                0x1a3a8a, self.turn == "challenger"))
+        if self.pinned_o:
+            await edit_pin(self.pinned_o, duel_card(
+                self.o_name, self.o_class, self.o_gif,
+                self.o_hp, self.o_hp_max, self.o_poison, self.o_regen,
+                0x8b0000, self.turn == "opponent"))
 
-    def apply_move(self, move_key: str, attacker: str) -> str:
+    def apply_move(self, move_key, attacker) -> str:
         move     = DUEL_MOVES[move_key]
         atk_name = self.c_name if attacker == "challenger" else self.o_name
         def_name = self.o_name if attacker == "challenger" else self.c_name
@@ -442,7 +332,7 @@ class DuelSession:
                 return f"♻ **{atk_name}** gains Regen for 3 turns!"
         return ""
 
-    def tick_status(self) -> list[str]:
+    def tick_status(self):
         lines = []
         for who in ("challenger", "opponent"):
             name = self.c_name if who == "challenger" else self.o_name
@@ -462,20 +352,190 @@ class DuelSession:
                     lines.append(f"♻ {name} regenerates **{h}** HP!")
         return lines
 
-    def is_over(self) -> str | None:
+    def is_over(self):
         if self.c_hp <= 0: return "opponent"
         if self.o_hp <= 0: return "challenger"
         return None
 
+# ─────────────────────────────────────────────
+#  ENEMY TURN LOGIC
+# ─────────────────────────────────────────────
+async def run_enemy_turn(channel, s: GameSession):
+    tick = []
+    if s.p_poison > 0:
+        s.p_hp = max(0, s.p_hp - 3); s.p_poison -= 1
+        tick.append("☠ Poison deals **3** damage to you!")
+    if s.p_regen > 0:
+        h = random.randint(5, 10); s.p_hp = min(s.p_hp_max, s.p_hp + h); s.p_regen -= 1
+        tick.append(f"♻ Regen restores **{h}** HP!")
+    if tick: await channel.send("\n".join(tick))
+    if s.p_hp <= 0:
+        await s.refresh_pins("💀 Defeated", "👹 Wins!")
+        await end_pve(channel, s, won=False); return
 
+    e      = s.enemy
+    e_roll = random.randint(1, 6); e_pts = e_roll
+    faces  = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+    lines  = [f"👹 **{e['name']}** rolls {faces[e_roll-1]} (**{e_roll}pt**)"]
+
+    if s.e_hp / s.e_hp_max < 0.3:
+        sig = e["sig"]
+        sig_range = e["hard"]["sig_dmg"] if s.hard_mode else sig["dmg"]
+        raw = random.randint(*sig_range)
+        if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
+        else:
+            dmg = raw // 2 if s.p_defend else raw
+            outcome = "normal"
+        if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+        halved_tag = " *(halved)*" if s.p_defend and dmg > 0 else ""
+        if outcome == "miss":   lines.append(f"💨 **{e['name']}** uses **{sig['name']}** — MISSED!")
+        elif outcome == "crit": lines.append(f"💥 **CRITICAL!** **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
+        else:                   lines.append(f"💥 **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
+        e_pts = max(0, e_pts - 6)
+
+    actions = []; att = 0
+    while e_pts > 0 and att < 20:
+        att += 1
+        affordable = [(k, m) for k, m in MOVES.items() if m["cost"] <= e_pts]
+        if not affordable: break
+        mk, m = random.choice(affordable)
+        if m["type"] == "atk":
+            slash_r = e["hard"]["slash_dmg"] if (s.hard_mode and mk == "slash") else (e["slash_dmg"] if mk == "slash" else m["dmg"])
+            raw = random.randint(*slash_r)
+            if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
+            else:
+                dmg = raw // 2 if s.p_defend else raw
+                outcome = "normal"
+            if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+            tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
+            actions.append(f"**{mk.capitalize()}**{tag} ({dmg} dmg)")
+        elif m["type"] == "heal":
+            h = random.randint(*m["heal"]); s.e_hp = min(s.e_hp_max, s.e_hp + h)
+            actions.append(f"**Cure** (+{h} HP)")
+        elif m["type"] == "status":
+            if m["effect"] == "poison" and s.p_poison == 0:
+                s.p_poison = 3; actions.append("**Poison**")
+            elif m["effect"] == "regen" and s.e_regen == 0:
+                s.e_regen = 3; actions.append("**Regen**")
+            else:
+                slash_r = e["hard"]["slash_dmg"] if s.hard_mode else e["slash_dmg"]
+                raw = random.randint(*slash_r)
+                if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
+                else:
+                    dmg = raw // 2 if s.p_defend else raw
+                    outcome = "normal"
+                if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+                tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
+                actions.append(f"**Slash**{tag} ({dmg} dmg)")
+        e_pts -= m["cost"]
+
+    if actions: lines.append(f"👹 {e['name']} uses: " + ", ".join(actions))
+
+    if s.e_poison > 0:
+        s.e_hp = max(0, s.e_hp - 3); s.e_poison -= 1
+        lines.append(f"☠ {e['name']} takes **3** poison damage!")
+    if s.e_regen > 0:
+        h = random.randint(5, 10); s.e_hp = min(s.e_hp_max, s.e_hp + h); s.e_regen -= 1
+        lines.append(f"♻ {e['name']} regenerates **{h}** HP!")
+
+    s.p_defend = False
+    await channel.send("\n".join(lines))
+    await s.refresh_pins()
+
+    if s.p_hp <= 0:
+        await s.refresh_pins("💀 Defeated", "👹 Wins!")
+        await end_pve(channel, s, won=False); return
+    if s.e_hp <= 0:
+        await s.refresh_pins("🏆 Victory!", "💀 Defeated")
+        await end_pve(channel, s, won=True); return
+
+    await channel.send("Your turn! What will you do?", view=RollView(s))
+
+async def end_pve(channel, s: GameSession, won: bool):
+    uid = s.player.id
+    if won:
+        gil_bonus = GIL_WIN_PVE * 2 if s.hard_mode else GIL_WIN_PVE
+        await db_add_gil(uid, gil_bonus)
+        hard_msg = ""
+        if not s.hard_mode:
+            enemy_key = next(k for k, v in ENEMIES.items() if v is s.enemy)
+            s.unlocked_hard = await db_get_hard_unlocked(uid)
+            if enemy_key not in s.unlocked_hard:
+                await db_unlock_hard(uid, enemy_key)
+                s.unlocked_hard.add(enemy_key)
+                hard_msg = f"\n\n🔴 **HARD MODE UNLOCKED:** {s.enemy['name']} (Hard)!\nType `!fight` to see it."
+        mode_tag = " *(Hard Mode)*" if s.hard_mode else ""
+        new_bal  = await db_get_gil(uid)
+        em = discord.Embed(title="🏆 VICTORY!",
+            description=f"**Congratulations, {s.char_name}!**{mode_tag}\n\n{random.choice(WIN_MSGS)}\n\n💰 +{gil_bonus} gil! Balance: **{new_bal} gil**{hard_msg}",
+            color=0x50e090)
+    else:
+        lose_bal = await db_get_gil(uid)
+        em = discord.Embed(title="💀 DEFEATED",
+            description=f"**{random.choice(LOSE_MSGS)}**\n\n💰 Balance: **{lose_bal} gil**",
+            color=0xe05050)
+    s.phase        = "select_enemy"
+    s.pinned_player = None
+    s.pinned_enemy  = None
+    s.unlocked_hard = await db_get_hard_unlocked(uid)
+    await channel.send(embed=em, view=FightMenuView(s))
+
+async def end_duel(channel, duel: DuelSession, winner_side: str):
+    duel.active = False
+    winner = duel.challenger if winner_side == "challenger" else duel.opponent
+    loser  = duel.opponent   if winner_side == "challenger" else duel.challenger
+    w_name = duel.c_name     if winner_side == "challenger" else duel.o_name
+    l_name = duel.o_name     if winner_side == "challenger" else duel.c_name
+    await db_add_gil(winner.id,  GIL_WIN_DUEL)
+    await db_add_gil(loser.id,  -GIL_LOSE_DUEL)
+    wb = await db_get_gil(winner.id); lb = await db_get_gil(loser.id)
+    em = discord.Embed(title="🏆 DUEL OVER!",
+        description=(
+            f"**{w_name}** defeats **{l_name}**!\n\n"
+            f"💰 {winner.mention} gains **{GIL_WIN_DUEL} gil** → Balance: **{wb} gil**\n"
+            f"💸 {loser.mention} loses **{GIL_LOSE_DUEL} gil** → Balance: **{lb} gil**"
+        ), color=0xf0d060)
+    await channel.send(embed=em)
+    try: await duel.channel.set_permissions(duel.opponent, overwrite=None)
+    except Exception: pass
+    if channel.id in active_duels: del active_duels[channel.id]
 
 # ─────────────────────────────────────────────
-#  BATTLE UI VIEWS  (discord.ui buttons)
+#  VIEWS
 # ─────────────────────────────────────────────
+class FightMenuView(discord.ui.View):
+    def __init__(self, session: GameSession):
+        super().__init__(timeout=300)
+        self.session = session
+        for key, e in ENEMIES.items():
+            btn = discord.ui.Button(label=f"⚔ {e['name']}", style=discord.ButtonStyle.danger, custom_id=f"fight_{key}")
+            btn.callback = self._make_cb(key, False)
+            self.add_item(btn)
+            if key in session.unlocked_hard:
+                hbtn = discord.ui.Button(label=f"🔴 {e['name']} (Hard)", style=discord.ButtonStyle.danger, custom_id=f"fight_{key}_hard")
+                hbtn.callback = self._make_cb(key, True)
+                self.add_item(hbtn)
+
+    def _make_cb(self, key, hard):
+        async def cb(interaction: discord.Interaction):
+            s = self.session
+            if interaction.user.id != s.player.id:
+                await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+            self.stop()
+            s.reset_for_battle(key, hard=hard)
+            mode_tag = "  🔴 HARD MODE" if hard else ""
+            await interaction.response.send_message(f"═══════  ⚔ BATTLE START{mode_tag}  ═══════")
+            ch = interaction.channel
+            p_msg = await ch.send(embed=pve_player_card(s))
+            e_msg = await ch.send(embed=pve_enemy_card(s))
+            await pin_msg(p_msg); await pin_msg(e_msg)
+            s.pinned_player = p_msg; s.pinned_enemy = e_msg
+            await ch.send("Your turn! What will you do?", view=RollView(s))
+        return cb
+
 
 class RollView(discord.ui.View):
-    """Shown at the start of the player's turn — Roll or Defend."""
-    def __init__(self, session):
+    def __init__(self, session: GameSession):
         super().__init__(timeout=300)
         self.session = session
 
@@ -484,15 +544,14 @@ class RollView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
-        base = random.randint(1, 6)
-        total = base + s.stored; s.stored = 0
+        base  = random.randint(1, 6); total = base + s.stored; s.stored = 0
         s.pts_left = s.pts_total = total
         faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
         note  = f" (+{total - base} stored) = **{total}**" if total > base else ""
         self.stop()
         await interaction.response.send_message(
-            f"{faces[base-1]} **{interaction.user.display_name}** rolled **{base}**{note}! **{s.pts_left}pt** to spend.",
-            view=MoveView(s, interaction.channel)
+            f"{faces[base-1]} **{interaction.user.display_name}** rolled **{base}**{note}!\n**{s.pts_left}pt** to spend — pick your moves:",
+            view=MoveView(s)
         )
         await s.refresh_pins()
 
@@ -501,15 +560,14 @@ class RollView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
-        base = random.randint(1, 6)
-        s.stored += base; s.p_defend = True
+        base = random.randint(1, 6); s.stored += base; s.p_defend = True
         faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
         self.stop()
         await interaction.response.send_message(
-            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** stored for next turn. Damage halved this turn."
+            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Damage halved this turn."
         )
         await s.refresh_pins()
-        await _enemy_turn_ui(interaction.channel, s)
+        await run_enemy_turn(interaction.channel, s)
 
     @discord.ui.button(label="🛑 Stop Battle", style=discord.ButtonStyle.danger)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -517,70 +575,62 @@ class RollView(discord.ui.View):
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
         self.stop()
-        await _reset_battle_state(s)
-        em = discord.Embed(title="⚔ Battle Stopped",
-            description="Returning to enemy select. Press **Fight** to choose your next opponent.",
-            color=0x2a55c0)
+        s.phase = "select_enemy"; s.enemy = None; s.queue = []; s.pinned_player = None; s.pinned_enemy = None
+        s.unlocked_hard = await db_get_hard_unlocked(interaction.user.id)
+        em = discord.Embed(title="⚔ Battle Stopped", description="Choose your next opponent.", color=0x2a55c0)
         await interaction.response.send_message(embed=em, view=FightMenuView(s))
 
 
 class MoveView(discord.ui.View):
-    """Shown after rolling — queue moves then execute."""
-    def __init__(self, session, channel):
+    MOVE_DEFS = [
+        ("⚔ Slash  (1pt)",    "slash",   discord.ButtonStyle.secondary, 1),
+        ("☠ Poison  (3pt)",   "poison",  discord.ButtonStyle.secondary, 3),
+        ("♻ Regen  (3pt)",    "regen",   discord.ButtonStyle.success,   3),
+        ("💚 Cure  (4pt)",     "cure",    discord.ButtonStyle.success,   4),
+        ("🔥 Fire  (5pt)",     "fire",    discord.ButtonStyle.danger,    5),
+        ("❄ Ice  (5pt)",      "ice",     discord.ButtonStyle.danger,    5),
+        ("⚡ Thunder  (5pt)",  "thunder", discord.ButtonStyle.danger,    5),
+    ]
+
+    def __init__(self, session: GameSession):
         super().__init__(timeout=300)
         self.session = session
-        self.channel = channel
-        self._refresh_buttons()
+        self._rebuild()
 
-    def _refresh_buttons(self):
+    def _rebuild(self):
         self.clear_items()
         s = self.session
-        MOVE_DEFS = [
-            ("⚔ Slash  (1pt)",   "slash",   discord.ButtonStyle.secondary, 1),
-            ("☠ Poison  (3pt)",  "poison",  discord.ButtonStyle.secondary, 3),
-            ("♻ Regen  (3pt)",   "regen",   discord.ButtonStyle.success,   3),
-            ("💚 Cure  (4pt)",    "cure",    discord.ButtonStyle.success,   4),
-            ("🔥 Fire  (5pt)",    "fire",    discord.ButtonStyle.danger,    5),
-            ("❄ Ice  (5pt)",     "ice",     discord.ButtonStyle.danger,    5),
-            ("⚡ Thunder  (5pt)", "thunder", discord.ButtonStyle.danger,    5),
-        ]
-        for label, key, style, cost in MOVE_DEFS:
-            btn = discord.ui.Button(
-                label=label, style=style,
-                disabled=s.pts_left < cost,
-                custom_id=f"move_{key}"
-            )
-            btn.callback = self._make_callback(key, cost)
+        for label, key, style, cost in self.MOVE_DEFS:
+            btn = discord.ui.Button(label=label, style=style, disabled=s.pts_left < cost, custom_id=f"mv_{key}")
+            btn.callback = self._make_move_cb(key, cost)
             self.add_item(btn)
-        # Execute button
         exec_btn = discord.ui.Button(
-            label="✅ Execute Actions" if s.queue else "✅ Execute",
+            label=f"✅ Execute ({len(s.queue)} queued)" if s.queue else "✅ Execute",
             style=discord.ButtonStyle.primary,
-            disabled=len(s.queue) == 0,
-            custom_id="execute"
+            disabled=not s.queue,
+            custom_id="mv_execute"
         )
-        exec_btn.callback = self._execute_callback
+        exec_btn.callback = self._execute_cb
         self.add_item(exec_btn)
 
-    def _make_callback(self, key, cost):
-        async def callback(interaction: discord.Interaction):
+    def _make_move_cb(self, key, cost):
+        async def cb(interaction: discord.Interaction):
             s = self.session
             if interaction.user.id != s.player.id:
                 await interaction.response.send_message("This is not your battle!", ephemeral=True); return
             if s.pts_left < cost:
-                await interaction.response.send_message(f"Not enough points for {key}!", ephemeral=True); return
-            s.pts_left -= cost
-            s.queue.append(key)
+                await interaction.response.send_message(f"Not enough points!", ephemeral=True); return
+            s.pts_left -= cost; s.queue.append(key)
             await s.refresh_pins()
-            self._refresh_buttons()
+            self._rebuild()
             queue_str = " → ".join(q.capitalize() for q in s.queue)
             await interaction.response.edit_message(
-                content=f"✅ **{key.capitalize()}** queued! Queue: **{queue_str}** | **{s.pts_left}pt** left",
+                content=f"✅ **{key.capitalize()}** queued! Queue: **{queue_str}** | **{s.pts_left}pt** left — pick more or Execute:",
                 view=self
             )
-        return callback
+        return cb
 
-    async def _execute_callback(self, interaction: discord.Interaction):
+    async def _execute_cb(self, interaction: discord.Interaction):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
@@ -592,10 +642,7 @@ class MoveView(discord.ui.View):
             m = MOVES[mk]
             if m["type"] == "atk":
                 raw = random.randint(*m["dmg"])
-                if s.hard_mode:
-                    dmg, outcome = calc_hit(raw)
-                else:
-                    dmg, outcome = raw, "normal"
+                dmg, outcome = calc_hit(raw) if s.hard_mode else (raw, "normal")
                 if dmg > 0: s.e_hp = max(0, s.e_hp - dmg)
                 lines.append(hit_line(mk.capitalize(), s.char_name, s.enemy["name"], outcome, dmg))
             elif m["type"] == "heal":
@@ -609,79 +656,34 @@ class MoveView(discord.ui.View):
         await s.refresh_pins()
         if s.e_hp <= 0:
             await s.refresh_pins("🏆 Victory!", "💀 Defeated")
-            await _end_pve_ui(interaction.channel, s, won=True); return
-        await _enemy_turn_ui(interaction.channel, s)
-
-
-class FightMenuView(discord.ui.View):
-    """Enemy selection buttons."""
-    def __init__(self, session):
-        super().__init__(timeout=300)
-        self.session = session
-        for key, e in ENEMIES.items():
-            unlocked = key in session.unlocked_hard
-            btn = discord.ui.Button(
-                label=f"⚔ {e['name']}",
-                style=discord.ButtonStyle.danger,
-                custom_id=f"fight_{key}"
-            )
-            btn.callback = self._make_fight_callback(key, False)
-            self.add_item(btn)
-            if unlocked:
-                hard_btn = discord.ui.Button(
-                    label=f"🔴 {e['name']} (Hard)",
-                    style=discord.ButtonStyle.danger,
-                    custom_id=f"fight_{key}_hard"
-                )
-                hard_btn.callback = self._make_fight_callback(key, True)
-                self.add_item(hard_btn)
-
-    def _make_fight_callback(self, key, hard):
-        async def callback(interaction: discord.Interaction):
-            s = self.session
-            if interaction.user.id != s.player.id:
-                await interaction.response.send_message("This is not your battle!", ephemeral=True); return
-            self.stop()
-            s.reset_for_battle(key, hard=hard)
-            if hard:
-                s.p_hp_max = s.chosen_class["hp"] + 50
-                s.p_hp     = s.p_hp_max
-            mode_tag = "  🔴 HARD MODE" if hard else ""
-            await interaction.response.send_message(f"═══════════  ⚔ BATTLE START{mode_tag}  ═══════════")
-            ch = interaction.channel
-            p_msg = await ch.send(embed=pve_player_card(s))
-            e_msg = await ch.send(embed=pve_enemy_card(s))
-            await pin_msg(p_msg); await pin_msg(e_msg)
-            s.pinned_player = p_msg; s.pinned_enemy = e_msg
-            await ch.send("Your turn! What will you do?", view=RollView(s))
-        return callback
+            await end_pve(interaction.channel, s, won=True); return
+        await run_enemy_turn(interaction.channel, s)
 
 
 class DuelMoveView(discord.ui.View):
-    """One-move buttons for PvP duels."""
-    def __init__(self, duel, channel):
+    DUEL_DEFS = [
+        ("⚔ Slash",    "slash",   discord.ButtonStyle.secondary),
+        ("☠ Poison",   "poison",  discord.ButtonStyle.secondary),
+        ("♻ Regen",    "regen",   discord.ButtonStyle.success),
+        ("💚 Cure",     "cure",    discord.ButtonStyle.success),
+        ("🔥 Fire",     "fire",    discord.ButtonStyle.danger),
+        ("❄ Ice",      "ice",     discord.ButtonStyle.danger),
+        ("⚡ Thunder",  "thunder", discord.ButtonStyle.danger),
+    ]
+
+    def __init__(self, duel: DuelSession):
         super().__init__(timeout=300)
-        self.duel    = duel
-        self.channel = channel
-        DUEL_DEFS = [
-            ("⚔ Slash",    "slash",   discord.ButtonStyle.secondary),
-            ("☠ Poison",   "poison",  discord.ButtonStyle.secondary),
-            ("♻ Regen",    "regen",   discord.ButtonStyle.success),
-            ("💚 Cure",     "cure",    discord.ButtonStyle.success),
-            ("🔥 Fire",     "fire",    discord.ButtonStyle.danger),
-            ("❄ Ice",      "ice",     discord.ButtonStyle.danger),
-            ("⚡ Thunder",  "thunder", discord.ButtonStyle.danger),
-        ]
-        for label, key, style in DUEL_DEFS:
+        self.duel = duel
+        for label, key, style in self.DUEL_DEFS:
             btn = discord.ui.Button(label=label, style=style, custom_id=f"duel_{key}")
-            btn.callback = self._make_callback(key)
+            btn.callback = self._make_cb(key)
             self.add_item(btn)
 
-    def _make_callback(self, move_key):
-        async def callback(interaction: discord.Interaction):
+    def _make_cb(self, move_key):
+        async def cb(interaction: discord.Interaction):
             duel = self.duel
             if not duel.active:
-                await interaction.response.send_message("This duel is already over!", ephemeral=True); return
+                await interaction.response.send_message("This duel is over!", ephemeral=True); return
             if interaction.user.id != duel.current_player().id:
                 await interaction.response.send_message(
                     f"It's not your turn! Waiting for **{duel.current_player().display_name}**.", ephemeral=True); return
@@ -692,157 +694,19 @@ class DuelMoveView(discord.ui.View):
             await duel.refresh_pins()
             winner_side = duel.is_over()
             if winner_side:
-                await _end_duel_ui(interaction.channel, duel, winner_side); return
+                await end_duel(interaction.channel, duel, winner_side); return
             if duel.turn == "opponent":
                 tick = duel.tick_status()
                 if tick: await interaction.channel.send("\n".join(tick))
                 await duel.refresh_pins()
                 winner_side = duel.is_over()
                 if winner_side:
-                    await _end_duel_ui(interaction.channel, duel, winner_side); return
+                    await end_duel(interaction.channel, duel, winner_side); return
             duel.swap_turn()
             await duel.refresh_pins()
             whose = duel.current_player().mention
-            await interaction.channel.send(f"{whose} — your turn! Pick a move:", view=DuelMoveView(duel, interaction.channel))
-        return callback
-
-
-async def _enemy_turn_ui(channel: discord.TextChannel, s):
-    """Enemy takes their turn then sends the Roll/Defend view."""
-    tick = []
-    if s.p_poison > 0: s.p_hp = max(0, s.p_hp - 3); s.p_poison -= 1; tick.append("☠ Poison deals **3** damage to you!")
-    if s.p_regen  > 0:
-        h = random.randint(5, 10); s.p_hp = min(s.p_hp_max, s.p_hp + h); s.p_regen -= 1
-        tick.append(f"♻ Regen restores **{h}** HP!")
-    if tick: await channel.send("\n".join(tick))
-    if s.p_hp <= 0:
-        await s.refresh_pins("💀 Defeated", "👹 Wins!")
-        await _end_pve_ui(channel, s, won=False); return
-
-    e = s.enemy; e_roll = random.randint(1, 6); e_pts = e_roll
-    faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
-    lines = [f"👹 **{e['name']}** rolls {faces[e_roll-1]} (**{e_roll}pt**)"]
-
-    if s.e_hp / s.e_hp_max < 0.3:
-        sig = e["sig"]
-        sig_range = e["hard"]["sig_dmg"] if s.hard_mode else sig["dmg"]
-        raw = random.randint(*sig_range)
-        if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
-        else: dmg = raw // 2 if s.p_defend else raw; outcome = "normal"
-        if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
-        halved_tag = " *(halved)*" if s.p_defend and dmg > 0 else ""
-        if outcome == "miss": lines.append(f"💨 **{e['name']}** uses **{sig['name']}** — but it **MISSED**!")
-        elif outcome == "crit": lines.append(f"💥 **CRITICAL!** **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
-        else: lines.append(f"💥 **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
-        e_pts = max(0, e_pts - 6)
-
-    actions = []; att = 0
-    while e_pts > 0 and att < 20:
-        att += 1
-        affordable = [(k, m) for k, m in MOVES.items() if m["cost"] <= e_pts]
-        if not affordable: break
-        mk, m = random.choice(affordable)
-        if m["type"] == "atk":
-            slash_range = e["hard"]["slash_dmg"] if (s.hard_mode and mk == "slash") else (e["slash_dmg"] if mk == "slash" else m["dmg"])
-            raw = random.randint(*slash_range)
-            if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
-            else: dmg = raw // 2 if s.p_defend else raw; outcome = "normal"
-            if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
-            tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
-            actions.append(f"**{mk.capitalize()}**{tag} ({dmg} dmg)")
-        elif m["type"] == "heal":
-            h = random.randint(*m["heal"]); s.e_hp = min(s.e_hp_max, s.e_hp + h); actions.append(f"**Cure** (+{h} HP)")
-        elif m["type"] == "status":
-            if m["effect"] == "poison" and s.p_poison == 0: s.p_poison = 3; actions.append("**Poison**")
-            elif m["effect"] == "regen" and s.e_regen == 0: s.e_regen = 3; actions.append("**Regen**")
-            else:
-                slash_range = e["hard"]["slash_dmg"] if s.hard_mode else e["slash_dmg"]
-                raw = random.randint(*slash_range)
-                if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
-                else: dmg = raw // 2 if s.p_defend else raw; outcome = "normal"
-                if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
-                tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
-                actions.append(f"**Slash**{tag} ({dmg} dmg)")
-        e_pts -= m["cost"]
-    if actions: lines.append(f"👹 {e['name']} uses: " + ", ".join(actions))
-
-    if s.e_poison > 0: s.e_hp = max(0, s.e_hp - 3); s.e_poison -= 1; lines.append(f"☠ {e['name']} takes **3** poison damage!")
-    if s.e_regen  > 0:
-        h = random.randint(5, 10); s.e_hp = min(s.e_hp_max, s.e_hp + h); s.e_regen -= 1
-        lines.append(f"♻ {e['name']} regenerates **{h}** HP!")
-
-    s.p_defend = False
-    await channel.send("\n".join(lines))
-    await s.refresh_pins()
-
-    if s.p_hp <= 0:
-        await s.refresh_pins("💀 Defeated", "👹 Wins!")
-        await _end_pve_ui(channel, s, won=False); return
-    if s.e_hp <= 0:
-        await s.refresh_pins("🏆 Victory!", "💀 Defeated")
-        await _end_pve_ui(channel, s, won=True); return
-
-    await channel.send("Your turn! What will you do?", view=RollView(s))
-
-
-async def _end_pve_ui(channel: discord.TextChannel, s, won: bool):
-    uid = s.player.id
-    if won:
-        gil_bonus = GIL_WIN_PVE * 2 if s.hard_mode else GIL_WIN_PVE
-        await db_add_gil(uid, gil_bonus)
-        hard_unlocked_msg = ""
-        if not s.hard_mode:
-            enemy_key = next(k for k, v in ENEMIES.items() if v is s.enemy)
-            s.unlocked_hard = await db_get_hard_unlocked(uid)
-            if enemy_key not in s.unlocked_hard:
-                await db_unlock_hard(uid, enemy_key)
-                s.unlocked_hard.add(enemy_key)
-                hard_unlocked_msg = f"\n\n🔴 **HARD MODE UNLOCKED:** {s.enemy['name']} (Hard)!"
-        mode_tag = " *(Hard Mode)*" if s.hard_mode else ""
-        new_bal = await db_get_gil(uid)
-        em = discord.Embed(title="🏆 VICTORY!",
-            description=f"**Congratulations, {s.char_name}!**{mode_tag}\n\n{random.choice(WIN_MSGS)}\n\n💰 +{gil_bonus} gil! Balance: **{new_bal} gil**{hard_unlocked_msg}",
-            color=0x50e090)
-    else:
-        lose_bal = await db_get_gil(uid)
-        em = discord.Embed(title="💀 DEFEATED",
-            description=f"**{random.choice(LOSE_MSGS)}**\n\n💰 Balance: **{lose_bal} gil**",
-            color=0xe05050)
-    await _reset_battle_state(s)
-    s.unlocked_hard = await db_get_hard_unlocked(uid)
-    await channel.send(embed=em, view=FightMenuView(s))
-
-
-async def _end_duel_ui(channel: discord.TextChannel, duel, winner_side: str):
-    duel.active = False
-    winner = duel.challenger if winner_side == "challenger" else duel.opponent
-    loser  = duel.opponent   if winner_side == "challenger" else duel.challenger
-    w_name = duel.c_name     if winner_side == "challenger" else duel.o_name
-    l_name = duel.o_name     if winner_side == "challenger" else duel.c_name
-    await db_add_gil(winner.id,  GIL_WIN_DUEL)
-    await db_add_gil(loser.id,  -GIL_LOSE_DUEL)
-    winner_bal = await db_get_gil(winner.id)
-    loser_bal  = await db_get_gil(loser.id)
-    em = discord.Embed(title="🏆 DUEL OVER!",
-        description=(
-            f"**{w_name}** defeats **{l_name}**!\n\n"
-            f"💰 {winner.mention} gains **{GIL_WIN_DUEL} gil** → Balance: **{winner_bal} gil**\n"
-            f"💸 {loser.mention} loses **{GIL_LOSE_DUEL} gil** → Balance: **{loser_bal} gil**"
-        ), color=0xf0d060)
-    await channel.send(embed=em)
-    try: await duel.channel.set_permissions(duel.opponent, overwrite=None)
-    except Exception: pass
-    if channel.id in active_duels:
-        del active_duels[channel.id]
-
-
-async def _reset_battle_state(s):
-    s.enemy = None; s.e_hp = s.e_hp_max = 0
-    s.e_poison = s.e_regen = 0
-    s.p_hp = s.p_hp_max
-    s.p_poison = s.p_regen = s.stored = s.pts_left = s.pts_total = 0
-    s.p_defend = False; s.queue = []; s.hard_mode = False
-    s.phase = "select_enemy"; s.pinned_player = None; s.pinned_enemy = None
+            await interaction.channel.send(f"{whose} — your turn! Pick a move:", view=DuelMoveView(duel))
+        return cb
 
 # ─────────────────────────────────────────────
 #  BOT SETUP
@@ -857,7 +721,6 @@ player_channels: dict[int, int]         = {}
 active_duels:    dict[int, DuelSession] = {}
 pending_duels:   dict[int, dict]        = {}
 
-
 # ─────────────────────────────────────────────
 #  !FF
 # ─────────────────────────────────────────────
@@ -867,7 +730,6 @@ async def start_ff(ctx: commands.Context):
         ch = bot.get_channel(player_channels[ctx.author.id])
         if ch:
             await ctx.send(f"{ctx.author.mention} You already have an active game: {ch.mention}"); return
-
     guild    = ctx.guild
     category = guild.get_channel(FF_CATEGORY_ID)
     overwrites = {
@@ -883,16 +745,14 @@ async def start_ff(ctx: commands.Context):
     player_channels[ctx.author.id] = game_channel.id
     await db_ensure(ctx.author.id)
     await ctx.send(f"✨ {ctx.author.mention} Your adventure awaits: {game_channel.mention}")
-    await _send_class_select(game_channel)
+    await send_class_select(game_channel)
 
-
-async def _send_class_select(channel: discord.TextChannel):
+async def send_class_select(channel):
     em = discord.Embed(title="⚔ Choose Your Class", description="Type `!class <name>` to select.", color=0x2a55c0)
     for key, c in CLASSES.items():
         em.add_field(name=f"`!class {key}` — {c['name']}", value=f"Role: {c['role']} | HP: {c['hp']}", inline=False)
     em.set_footer(text="e.g.  !class warrior")
     await channel.send(embed=em)
-
 
 # ─────────────────────────────────────────────
 #  CHARACTER CREATION
@@ -910,7 +770,6 @@ async def choose_class(ctx: commands.Context, class_key: str):
     em.add_field(name="Next", value="Enter your name: `!name YourName`", inline=False)
     await ctx.send(embed=em)
 
-
 @bot.command(name="name")
 async def set_name(ctx: commands.Context, *, char_name: str):
     if not _is_game_channel(ctx) or ctx.channel.id not in active_sessions: return
@@ -921,290 +780,41 @@ async def set_name(ctx: commands.Context, *, char_name: str):
     em.add_field(name="Type `!zodiac <month>`", value="\n".join(f"`{m}` → {z}" for m, z in ZODIAC_MAP.items()), inline=False)
     await ctx.send(embed=em)
 
-
 @bot.command(name="zodiac")
 async def set_zodiac(ctx: commands.Context, *, month: str):
     if not _is_game_channel(ctx) or ctx.channel.id not in active_sessions: return
     month = month.capitalize()
     if month not in ZODIAC_MAP:
-        await ctx.send("Unknown month. Use a full month name, e.g. `!zodiac March`"); return
+        await ctx.send("Unknown month. Use a full month name e.g. `!zodiac March`"); return
     s = active_sessions[ctx.channel.id]
     s.zodiac = f"{month} — {ZODIAC_MAP[month]}"
+    s.unlocked_hard = await db_get_hard_unlocked(ctx.author.id)
+    bal = await db_get_gil(ctx.author.id)
     em = discord.Embed(title="✨ Character Created!", color=0xf0d060)
     em.set_image(url=ASSET_BASE_URL + s.chosen_class["gif"])
-    em.add_field(name="Name",   value=s.char_name,              inline=True)
-    em.add_field(name="Class",  value=s.chosen_class["name"],   inline=True)
-    em.add_field(name="Zodiac", value=s.zodiac,                 inline=True)
-    em.add_field(name="Gil",    value=f"💰 {await db_get_gil(ctx.author.id)} gil", inline=True)
-    em.set_footer(text="!fight to battle  |  !ffduel @user to challenge  |  !gil for balance")
+    em.add_field(name="Name",   value=s.char_name,            inline=True)
+    em.add_field(name="Class",  value=s.chosen_class["name"], inline=True)
+    em.add_field(name="Zodiac", value=s.zodiac,               inline=True)
+    em.add_field(name="Gil",    value=f"💰 {bal} gil",         inline=True)
+    em.set_footer(text="!fight to battle  |  !ffduel @user to challenge  |  !gil for balance  |  !ffreset to restart")
     await ctx.send(embed=em)
 
-
 # ─────────────────────────────────────────────
-#  PvE BATTLE
+#  !fight — button enemy select
 # ─────────────────────────────────────────────
 @bot.command(name="fight")
 async def fight(ctx: commands.Context):
     if not _is_game_channel(ctx) or ctx.channel.id not in active_sessions: return
-    em = discord.Embed(title="👹 Choose Your Opponent", color=0x2a55c0)
-    # Normal bosses — always available
-    for key, e in ENEMIES.items():
-        em.add_field(
-            name=f"`!battle {key}` — {e['name']}",
-            value=f"HP: {e['hp']} | Signature: **{e['sig']['name']}** *(below 30% HP)*",
-            inline=False,
-        )
-    # Hard mode bosses — show if unlocked
-    unlocked = unlocked_hard.get(ctx.author.id, set())
-    if unlocked:
-        em.add_field(name="​", value="**🔓 Hard Mode Unlocked:**", inline=False)
-        for key in unlocked:
-            e = HARD_ENEMIES[key]
-            thresh = int(e.get("sig_threshold", 0.4) * 100)
-            em.add_field(
-                name=f"`!battle {key}` — {e['name']} ☆",
-                value=f"HP: {e['hp']} | Signature: **{e['sig']['name']}** *(below {thresh}% HP)* | You get **+100 HP**",
-                inline=False,
-            )
-    else:
-        em.add_field(name="​", value="🔒 Defeat each boss to unlock their **Hard Mode** version!", inline=False)
-    await ctx.send(embed=em)
-
-
-@bot.command(name="battle")
-async def battle(ctx: commands.Context, enemy_key: str):
-    if not _is_game_channel(ctx) or ctx.channel.id not in active_sessions: return
-    enemy_key = enemy_key.lower()
     s = active_sessions[ctx.channel.id]
-    is_hard = enemy_key.endswith("+")
-    if enemy_key not in ALL_ENEMIES:
-        await ctx.send(f"Unknown enemy. Use `!fight` to see available opponents."); return
-    if is_hard and not is_unlocked(ctx.author.id, enemy_key):
-        base = enemy_key.replace("+", "")
-        await ctx.send(f"🔒 **{ALL_ENEMIES[enemy_key]['name']}** is locked! Defeat **{ENEMIES[base]['name']}** first."); return
-    s.reset_for_battle(enemy_key, hard_mode=is_hard)
-
-    # Send player card first, enemy card second — both pinned
-    mode_tag = "  🔴 HARD MODE" if s.hard_mode else ""
-    await ctx.send(f"═══════════════  ⚔ BATTLE START{mode_tag}  ═══════════════")
-    p_msg = await ctx.send(embed=pve_player_card(s))
-    e_msg = await ctx.send(embed=pve_enemy_card(s))
-    await pin_msg(p_msg)
-    await pin_msg(e_msg)
-    s.pinned_player = p_msg
-    s.pinned_enemy  = e_msg
-
-    await ctx.send("🎲 Type `!roll` to roll your dice!")
-
-
-@bot.command(name="roll")
-async def roll_dice(ctx: commands.Context):
-    s = _get_pve(ctx)
-    if not s: return
-    base = random.randint(1, 6); total = base + s.stored; s.stored = 0
-    s.pts_left = s.pts_total = total
-    faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
-    note  = f" (+{total-base} stored) = **{total}**" if total > base else ""
-    await s.refresh_pins()
-    await ctx.send(
-        f"{faces[base-1]} **{ctx.author.display_name}** rolled **{base}**{note}! **{s.pts_left}pt** to spend.\n"
-        f"Moves: `!slash(1)` `!poison(3)` `!regen(3)` `!cure(4)` `!fire(5)` `!ice(5)` `!thunder(5)`\n"
-        f"Queue moves then `!execute` — or `!defend` to store roll & halve damage."
-    )
-
-
-@bot.command(name="defend")
-async def defend(ctx: commands.Context):
-    s = _get_pve(ctx)
-    if not s: return
-    base = random.randint(1, 6); s.stored += base; s.p_defend = True
-    faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
-    await ctx.send(f"🛡 {faces[base-1]} **Defend**! Rolled **{base}** stored for next turn. Damage halved.")
-    await s.refresh_pins()
-    await _enemy_turn(ctx, s)
-
-
-async def _queue_move(ctx: commands.Context, move_key: str):
-    s = _get_pve(ctx)
-    if not s: return
-    move = MOVES[move_key]
-    if s.pts_left < move["cost"]:
-        await ctx.send(f"Not enough points for **{move_key.capitalize()}** (costs {move['cost']}pt, have {s.pts_left}pt)."); return
-    s.pts_left -= move["cost"]; s.queue.append(move_key)
-    await s.refresh_pins()
-    await ctx.send(f"✅ **{move_key.capitalize()}** queued. **{s.pts_left}pt** left. Type `!execute` when ready.")
-
-
-@bot.command(name="execute")
-async def execute(ctx: commands.Context):
-    s = _get_pve(ctx)
-    if not s or not s.queue:
-        await ctx.send("Nothing queued! Add moves then `!execute`."); return
-    lines = []
-    for mk in s.queue:
-        m = MOVES[mk]
-        if m["type"] == "atk":
-            raw = random.randint(*m["dmg"])
-            if s.hard_mode:
-                dmg, outcome = calc_hit(raw)
-            else:
-                dmg, outcome = raw, "normal"
-            if dmg > 0: s.e_hp = max(0, s.e_hp - dmg)
-            lines.append(hit_line(mk.capitalize(), s.char_name, s.enemy['name'], outcome, dmg))
-        elif m["type"] == "heal":
-            h = random.randint(*m["heal"]); s.p_hp = min(s.p_hp_max_battle, s.p_hp + h)
-            lines.append(f"💚 **Cure** restores **{h}** HP!")
-        elif m["type"] == "status":
-            if m["effect"] == "poison": s.e_poison = 3; lines.append(f"☠ **Poison** inflicted on {s.enemy['name']}!")
-            elif m["effect"] == "regen": s.p_regen = 3; lines.append("♻ **Regen** granted!")
-    s.queue = []
-    await ctx.send("\n".join(lines))
-    if s.e_hp <= 0:
-        await s.refresh_pins("🏆 Victory!", "💀 Defeated")
-        await _end_pve(ctx, s, won=True); return
-    await _enemy_turn(ctx, s)
-
-
-async def _enemy_turn(ctx: commands.Context, s: GameSession):
-    tick = []
-    if s.p_poison > 0: s.p_hp = max(0, s.p_hp - 3); s.p_poison -= 1; tick.append("☠ Poison deals **3** damage to you!")
-    if s.p_regen  > 0:
-        h = random.randint(5, 10); s.p_hp = min(s.p_hp_max_battle, s.p_hp + h); s.p_regen -= 1
-        tick.append(f"♻ Regen restores **{h}** HP!")
-    if tick: await ctx.send("\n".join(tick))
-    if s.p_hp <= 0:
-        await s.refresh_pins("💀 Defeated", "👹 Wins!")
-        await _end_pve(ctx, s, won=False); return
-
-    e = s.enemy; e_roll = random.randint(1, 6); e_pts = e_roll
-    faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
-    lines = [f"👹 **{e['name']}** rolls {faces[e_roll-1]} (**{e_roll}pt**)"]
-
-    sig_thresh = s.enemy.get("sig_threshold", 0.3)
-    if s.e_hp / s.e_hp_max < sig_thresh:
-        sig = e["sig"]
-        sig_range = e["hard"]["sig_dmg"] if s.hard_mode else sig["dmg"]
-        raw = random.randint(*sig_range)
-        if s.hard_mode:
-            dmg, outcome = calc_hit(raw, halved=s.p_defend)
-        else:
-            dmg = raw // 2 if s.p_defend else raw
-            outcome = "normal"
-        if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
-        halved_tag = " *(halved)*" if s.p_defend and dmg > 0 else ""
-        if outcome == "miss":
-            lines.append(f"💨 **{e['name']}** uses **{sig['name']}** — but it **MISSED**!")
-        elif outcome == "crit":
-            lines.append(f"💥 **CRITICAL!** **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
-        else:
-            lines.append(f"💥 **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
-        e_pts = max(0, e_pts - 6)
-
-    actions = []; att = 0
-    while e_pts > 0 and att < 20:
-        att += 1
-        affordable = [(k, m) for k, m in MOVES.items() if m["cost"] <= e_pts]
-        if not affordable: break
-        mk, m = random.choice(affordable)
-        if m["type"] == "atk":
-            slash_range = e["hard"]["slash_dmg"] if (s.hard_mode and mk == "slash") else (e["slash_dmg"] if mk == "slash" else m["dmg"])
-            raw = random.randint(*slash_range)
-            if s.hard_mode:
-                dmg, outcome = calc_hit(raw, halved=s.p_defend)
-            else:
-                dmg = raw // 2 if s.p_defend else raw
-                outcome = "normal"
-            if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
-            tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
-            actions.append(f"**{mk.capitalize()}**{tag} ({dmg} dmg)")
-        elif m["type"] == "heal":
-            h = random.randint(*m["heal"]); s.e_hp = min(s.e_hp_max, s.e_hp + h); actions.append(f"**Cure** (+{h} HP)")
-        elif m["type"] == "status":
-            if m["effect"] == "poison" and s.p_poison == 0: s.p_poison = 3; actions.append("**Poison**")
-            elif m["effect"] == "regen" and s.e_regen == 0: s.e_regen = 3; actions.append("**Regen**")
-            else:
-                slash_range = e["hard"]["slash_dmg"] if s.hard_mode else e["slash_dmg"]
-                raw = random.randint(*slash_range)
-                if s.hard_mode:
-                    dmg, outcome = calc_hit(raw, halved=s.p_defend)
-                else:
-                    dmg = raw // 2 if s.p_defend else raw
-                    outcome = "normal"
-                if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
-                tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
-                actions.append(f"**Slash**{tag} ({dmg} dmg)")
-        e_pts -= m["cost"]
-    if actions: lines.append(f"👹 {e['name']} uses: " + ", ".join(actions))
-
-    if s.e_poison > 0: s.e_hp = max(0, s.e_hp - 3); s.e_poison -= 1; lines.append(f"☠ {e['name']} takes **3** poison damage!")
-    if s.e_regen  > 0:
-        h = random.randint(5, 10); s.e_hp = min(s.e_hp_max, s.e_hp + h); s.e_regen -= 1
-        lines.append(f"♻ {e['name']} regenerates **{h}** HP!")
-
-    s.p_defend = False
-    await ctx.send("\n".join(lines))
-
-    if s.p_hp <= 0:
-        await s.refresh_pins("💀 Defeated", "👹 Wins!")
-        await _end_pve(ctx, s, won=False); return
-    if s.e_hp <= 0:
-        await s.refresh_pins("🏆 Victory!", "💀 Defeated")
-        await _end_pve(ctx, s, won=True); return
-
-    await s.refresh_pins()
-    await ctx.send("🎲 Your turn! Type `!roll`.")
-
-
-async def _end_pve(ctx: commands.Context, s: GameSession, won: bool):
-    if won:
-        add_gil(ctx.author.id, GIL_WIN_PVE)
-        # Determine if this was a normal or hard fight
-        enemy_key = next((k for k, v in ALL_ENEMIES.items() if v is s.enemy), None)
-        is_hard   = s.hard_mode
-        hard_key  = (enemy_key + "+") if not is_hard and enemy_key else None
-
-        # Unlock hard mode if normal boss was defeated
-        newly_unlocked = False
-        if not is_hard and enemy_key:
-            if not is_unlocked(ctx.author.id, enemy_key + "+"):
-                unlock_hard(ctx.author.id, enemy_key)
-                newly_unlocked = True
-
-        unlock_line = (
-            f"\n\n🔓 **{s.enemy['name']} ☆ (Hard Mode)** is now unlocked! "
-            f"Type `!battle {hard_key}` to challenge a stronger version with +100 HP for you!"
-            if newly_unlocked else
-            (f"\n\n⚔ Hard mode already unlocked! Try `!battle {hard_key}` for an even greater challenge."
-             if hard_key and is_unlocked(ctx.author.id, hard_key) else "")
-        )
-        hard_clear = "\n\n🌟 **Hard Mode cleared!** You are a true legend." if is_hard else ""
-
-        gil_bonus = GIL_WIN_PVE * 2 if is_hard else GIL_WIN_PVE
-        if is_hard: add_gil(ctx.author.id, GIL_WIN_PVE)  # extra gil for hard mode
-
-        em = discord.Embed(title="🏆 VICTORY!",
-            description=(
-                f"**Congratulations, {s.char_name}!**\n\n{random.choice(WIN_MSGS)}"
-                f"\n\n💰 +{gil_bonus} gil! Balance: **{get_gil(ctx.author.id)} gil**"
-                + unlock_line + hard_clear
-            ),
-            color=0x50e090)
-        em.set_footer(text="!fight to see all opponents  |  !ffduel @user to challenge someone")
-    else:
-        lose_bal = await db_get_gil(ctx.author.id)
-        em = discord.Embed(title="💀 DEFEATED",
-            description=f"**{random.choice(LOSE_MSGS)}**\n\n💰 Balance: **{lose_bal} gil**",
-            color=0xe05050)
-        em.set_footer(text="!fight to try again.")
-    await ctx.send(embed=em)
-    s.p_hp = s.p_hp_max; s.p_hp_max_battle = s.p_hp_max
-    s.p_poison = s.p_regen = s.stored = 0
-    s.p_defend = False; s.queue = []; s.phase = "rolled"; s.hard_mode = False
-    s.pinned_player = None; s.pinned_enemy = None
-
+    s.unlocked_hard = await db_get_hard_unlocked(ctx.author.id)
+    em = discord.Embed(title="👹 Choose Your Opponent", description="Click an enemy to begin!", color=0x2a55c0)
+    for key, e in ENEMIES.items():
+        lock = "🔒 Hard locked" if key not in s.unlocked_hard else "🔴 Hard available"
+        em.add_field(name=e["name"], value=f"HP: {e['hp']} | {lock}", inline=True)
+    await ctx.send(embed=em, view=FightMenuView(s))
 
 # ─────────────────────────────────────────────
-#  DUEL SYSTEM
+#  !ffduel @user
 # ─────────────────────────────────────────────
 @bot.command(name="ffduel")
 async def ffduel(ctx: commands.Context, opponent: discord.Member):
@@ -1212,45 +822,37 @@ async def ffduel(ctx: commands.Context, opponent: discord.Member):
         await ctx.send("Use this in your FF Arena channel!"); return
     if opponent.id == ctx.author.id:
         await ctx.send("You can't duel yourself!"); return
-
     c_session = active_sessions.get(ctx.channel.id)
     if not c_session or not c_session.char_name:
-        await ctx.send("Finish character creation first (`!class`, `!name`, `!zodiac`)!"); return
-
+        await ctx.send("Finish character creation first!"); return
     opp_ch_id = player_channels.get(opponent.id)
     if not opp_ch_id:
         await ctx.send(f"**{opponent.display_name}** hasn't started FF Arena yet!"); return
-
     o_session = active_sessions.get(opp_ch_id)
     if not o_session or not o_session.char_name:
         await ctx.send(f"**{opponent.display_name}** hasn't finished character creation yet!"); return
-
     if ctx.channel.id in active_duels:
         await ctx.send("There's already an active duel in this channel!"); return
     if ctx.author.id in pending_duels:
         await ctx.send("You already have a pending challenge out!"); return
-
     pending_duels[ctx.author.id] = {
         "opponent": opponent, "challenger": ctx.author,
         "c_session": c_session, "o_session": o_session, "channel": ctx.channel,
     }
-
     em = discord.Embed(title="⚔ Duel Challenge!",
         description=(
             f"{opponent.mention} — **{c_session.char_name}** [{c_session.chosen_class['name']}] challenges you!\n\n"
             f"Go to your channel and type:\n"
             f"`!duelaccept {ctx.author.mention}` to accept\n"
             f"`!dueldecline {ctx.author.mention}` to decline\n\n"
-            f"⏱ You have **60 seconds** to respond."
+            f"⏱ 60 seconds to respond."
         ), color=0x8b0000)
     em.set_footer(text=f"💰 Winner +{GIL_WIN_DUEL} gil | Loser -{GIL_LOSE_DUEL} gil")
     await ctx.send(embed=em)
-
     await asyncio.sleep(60)
     if ctx.author.id in pending_duels:
         del pending_duels[ctx.author.id]
         await ctx.send(f"⏱ Duel challenge to {opponent.mention} expired.")
-
 
 @bot.command(name="duelaccept")
 async def duel_accept(ctx: commands.Context, challenger: discord.Member):
@@ -1259,29 +861,25 @@ async def duel_accept(ctx: commands.Context, challenger: discord.Member):
     if not data or data["opponent"].id != ctx.author.id:
         await ctx.send("No pending challenge from that player."); return
     del pending_duels[challenger.id]
-
     c_channel = data["channel"]
     await c_channel.set_permissions(ctx.author, send_messages=True, view_channel=True)
-
     duel = DuelSession(data["challenger"], ctx.author, data["c_session"], data["o_session"], c_channel)
     active_duels[c_channel.id] = duel
-
-    # Send challenger card + opponent card — both pinned, both showing their GIF large
     await c_channel.send("═══════════════  ⚔ DUEL BEGINS  ═══════════════")
-    c_msg = await c_channel.send(embed=duel.c_card())
-    o_msg = await c_channel.send(embed=duel.o_card())
-    await pin_msg(c_msg)
-    await pin_msg(o_msg)
-    duel.pinned_c = c_msg
-    duel.pinned_o = o_msg
-
+    c_msg = await c_channel.send(embed=duel_card(
+        duel.c_name, duel.c_class, duel.c_gif, duel.c_hp, duel.c_hp_max,
+        duel.c_poison, duel.c_regen, 0x1a3a8a, True))
+    o_msg = await c_channel.send(embed=duel_card(
+        duel.o_name, duel.o_class, duel.o_gif, duel.o_hp, duel.o_hp_max,
+        duel.o_poison, duel.o_regen, 0x8b0000, False))
+    await pin_msg(c_msg); await pin_msg(o_msg)
+    duel.pinned_c = c_msg; duel.pinned_o = o_msg
     await c_channel.send(
-        f"💰 Stakes: Winner **+{GIL_WIN_DUEL} gil** | Loser **-{GIL_LOSE_DUEL} gil**\n"
+        f"💰 Winner **+{GIL_WIN_DUEL} gil** | Loser **-{GIL_LOSE_DUEL} gil**\n"
         f"{duel.challenger.mention} goes first — pick your move:",
-        view=DuelMoveView(duel, c_channel)
+        view=DuelMoveView(duel)
     )
     await ctx.send(f"✅ Duel accepted! Head to {c_channel.mention} to fight!")
-
 
 @bot.command(name="dueldecline")
 async def duel_decline(ctx: commands.Context, challenger: discord.Member):
@@ -1291,91 +889,6 @@ async def duel_decline(ctx: commands.Context, challenger: discord.Member):
         await data["channel"].send(f"❌ {ctx.author.display_name} declined the duel challenge.")
         await ctx.send("❌ Duel declined.")
 
-
-async def _handle_duel_move(ctx: commands.Context, move_key: str) -> bool:
-    duel = active_duels.get(ctx.channel.id)
-    if not duel or not duel.active: return False
-
-    if ctx.author.id != duel.current_player().id:
-        await ctx.send(f"It's not your turn! Waiting for **{duel.current_player().display_name}**."); return True
-
-    attacker = "challenger" if ctx.author.id == duel.challenger.id else "opponent"
-    log = duel.apply_move(move_key, attacker)
-    await ctx.send(log)
-
-    winner_side = duel.is_over()
-    if winner_side:
-        await duel.refresh_pins()
-        await _end_duel(ctx, duel, winner_side); return True
-
-    if duel.turn == "opponent":
-        tick = duel.tick_status()
-        if tick: await ctx.send("\n".join(tick))
-        winner_side = duel.is_over()
-        if winner_side:
-            await duel.refresh_pins()
-            await _end_duel(ctx, duel, winner_side); return True
-
-    duel.swap_turn()
-    await duel.refresh_pins()
-    return True
-
-
-async def _end_duel(ctx: commands.Context, duel: DuelSession, winner_side: str):
-    duel.active = False
-    winner = duel.challenger if winner_side == "challenger" else duel.opponent
-    loser  = duel.opponent   if winner_side == "challenger" else duel.challenger
-    w_name = duel.c_name     if winner_side == "challenger" else duel.o_name
-    l_name = duel.o_name     if winner_side == "challenger" else duel.c_name
-
-    await db_add_gil(winner.id,  GIL_WIN_DUEL)
-    await db_add_gil(loser.id,  -GIL_LOSE_DUEL)
-    winner_bal = await db_get_gil(winner.id)
-    loser_bal  = await db_get_gil(loser.id)
-
-    em = discord.Embed(title="🏆 DUEL OVER!",
-        description=(
-            f"**{w_name}** defeats **{l_name}**!\n\n"
-            f"💰 {winner.mention} gains **{GIL_WIN_DUEL} gil** → Balance: **{winner_bal} gil**\n"
-            f"💸 {loser.mention} loses **{GIL_LOSE_DUEL} gil** → Balance: **{loser_bal} gil**"
-        ), color=0xf0d060)
-    await ctx.send(embed=em)
-
-    try: await duel.channel.set_permissions(duel.opponent, overwrite=None)
-    except Exception: pass
-    del active_duels[duel.channel.id]
-
-
-# Move commands — duel first, fall back to PvE
-@bot.command(name="slash")
-async def d_slash(ctx):
-    if not await _handle_duel_move(ctx, "slash"): await _queue_move(ctx, "slash")
-
-@bot.command(name="poison")
-async def d_poison(ctx):
-    if not await _handle_duel_move(ctx, "poison"): await _queue_move(ctx, "poison")
-
-@bot.command(name="regen")
-async def d_regen(ctx):
-    if not await _handle_duel_move(ctx, "regen"): await _queue_move(ctx, "regen")
-
-@bot.command(name="cure")
-async def d_cure(ctx):
-    if not await _handle_duel_move(ctx, "cure"): await _queue_move(ctx, "cure")
-
-@bot.command(name="fire")
-async def d_fire(ctx):
-    if not await _handle_duel_move(ctx, "fire"): await _queue_move(ctx, "fire")
-
-@bot.command(name="ice")
-async def d_ice(ctx):
-    if not await _handle_duel_move(ctx, "ice"): await _queue_move(ctx, "ice")
-
-@bot.command(name="thunder")
-async def d_thunder(ctx):
-    if not await _handle_duel_move(ctx, "thunder"): await _queue_move(ctx, "thunder")
-
-
 # ─────────────────────────────────────────────
 #  !gil
 # ─────────────────────────────────────────────
@@ -1383,89 +896,35 @@ async def d_thunder(ctx):
 async def show_gil(ctx: commands.Context):
     if not _is_game_channel(ctx): return
     s    = active_sessions.get(ctx.channel.id)
-    name = s.char_name if s else ctx.author.display_name
+    name = s.char_name if s and s.char_name else ctx.author.display_name
     bal  = await db_get_gil(ctx.author.id)
-    em   = discord.Embed(title="💰 Gil Balance",
-        description=f"**{name}** has **{bal} gil**", color=0xf0d060)
-    em.set_footer(text=f"PvE win: +{GIL_WIN_PVE} gil  |  Duel win: +{GIL_WIN_DUEL} gil  |  Duel loss: -{GIL_LOSE_DUEL} gil")
+    em   = discord.Embed(title="💰 Gil Balance", description=f"**{name}** has **{bal} gil**", color=0xf0d060)
+    em.set_footer(text=f"PvE win: +{GIL_WIN_PVE} gil  |  Hard win: +{GIL_WIN_PVE*2} gil  |  Duel win: +{GIL_WIN_DUEL} gil  |  Duel loss: -{GIL_LOSE_DUEL} gil")
     await ctx.send(embed=em)
 
-
 # ─────────────────────────────────────────────
-#  !ffreset — master reset, wipe session and restart character creation
+#  !ffreset
 # ─────────────────────────────────────────────
 @bot.command(name="ffreset")
 async def ffreset(ctx: commands.Context):
     if not _is_game_channel(ctx): return
     if ctx.author.id not in player_channels or player_channels[ctx.author.id] != ctx.channel.id:
         await ctx.send("You can only reset from your own FF Arena channel."); return
-
     cid = ctx.channel.id
-
-    # Wipe any active duel this channel is involved in
     if cid in active_duels:
         duel = active_duels[cid]
-        # Revoke opponent write access if they were granted it
-        try:
-            await ctx.channel.set_permissions(duel.opponent, overwrite=None)
-        except Exception:
-            pass
+        try: await ctx.channel.set_permissions(duel.opponent, overwrite=None)
+        except Exception: pass
         del active_duels[cid]
-
-    # Cancel any pending duel challenge sent by this player
     if ctx.author.id in pending_duels:
         del pending_duels[ctx.author.id]
-
-    # Wipe the game session entirely
     if cid in active_sessions:
         del active_sessions[cid]
-
-    em = discord.Embed(
-        title="🔄 Character Reset",
-        description=(
-            f"{ctx.author.mention} has been reset!\n\n"
-            "💰 Gil balance and hard mode unlocks are **preserved**.\n"
-            "Choose a new class to start fresh."
-        ),
-        color=0x2a55c0,
-    )
+    em = discord.Embed(title="🔄 Character Reset",
+        description=f"{ctx.author.mention} has been reset!\n\n💰 Gil and hard mode unlocks are **preserved**.\nChoose a new class to start fresh.",
+        color=0x2a55c0)
     await ctx.send(embed=em)
-    await _send_class_select(ctx.channel)
-
-
-# ─────────────────────────────────────────────
-#  !stop — abort current PvE battle, return to enemy select
-# ─────────────────────────────────────────────
-@bot.command(name="stop")
-async def stop_battle(ctx: commands.Context):
-    if not _is_game_channel(ctx): return
-    s = active_sessions.get(ctx.channel.id)
-    if not s:
-        await ctx.send("No active session found."); return
-    if ctx.author.id != s.player.id:
-        await ctx.send("Only the channel owner can stop the battle."); return
-
-    # Reset all battle state cleanly
-    s.enemy        = None
-    s.e_hp         = s.e_hp_max = 0
-    s.e_poison     = s.e_regen = 0
-    s.p_hp         = s.p_hp_max
-    s.p_poison     = s.p_regen = s.stored = s.pts_left = s.pts_total = 0
-    s.p_defend     = False
-    s.queue        = []
-    s.hard_mode    = False
-    s.phase        = "select_enemy"
-    s.pinned_player = None
-    s.pinned_enemy  = None
-
-    s.unlocked_hard = await db_get_hard_unlocked(ctx.author.id)
-    em = discord.Embed(
-        title="⚔ Battle Stopped",
-        description="Returning to enemy select. Press a button to choose your next opponent.",
-        color=0x2a55c0,
-    )
-    await ctx.send(embed=em, view=FightMenuView(s))
-
+    await send_class_select(ctx.channel)
 
 # ─────────────────────────────────────────────
 #  !endgame
@@ -1482,19 +941,11 @@ async def endgame(ctx: commands.Context):
     active_duels.pop(cid, None)
     await ctx.channel.delete()
 
-
 # ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
 def _is_game_channel(ctx: commands.Context) -> bool:
     return ctx.channel.id in active_sessions or ctx.channel.id in player_channels.values()
-
-def _get_pve(ctx: commands.Context) -> GameSession | None:
-    if ctx.channel.id in active_duels: return None
-    s = active_sessions.get(ctx.channel.id)
-    if not s or s.player.id != ctx.author.id: return None
-    return s
-
 
 @bot.event
 async def on_ready():
