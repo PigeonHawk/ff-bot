@@ -474,21 +474,6 @@ class RollAgainView(discord.ui.View):
         )
         await s.refresh_pins()
 
-    @discord.ui.button(label="🛡 Defend  (store roll + halve damage)", style=discord.ButtonStyle.secondary, row=0)
-    async def defend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = self.session
-        if interaction.user.id != s.player.id:
-            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
-        base = random.randint(1, 6); s.stored += base; s.p_defend = True
-        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
-        self.stop()
-        await interaction.response.send_message(
-            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Damage halved this turn.\n"
-            f"📦 Stored roll: **{s.stored}pt** carries into your next dice roll."
-        )
-        await s.refresh_pins()
-        await run_enemy_turn(interaction.channel, s)
-
     @discord.ui.button(label="📊 Status", style=discord.ButtonStyle.secondary, row=0)
     async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = self.session
@@ -595,7 +580,7 @@ class FightMenuView(discord.ui.View):
 
 
 class RollView(discord.ui.View):
-    """Row 1: Roll | Defend | Status   Row 2: Stop"""
+    """Row 0: Roll | Status   Row 1: Stop"""
     def __init__(self, session: GameSession):
         super().__init__(timeout=300)
         self.session = session
@@ -615,21 +600,6 @@ class RollView(discord.ui.View):
             view=MoveView(s)
         )
         await s.refresh_pins()
-
-    @discord.ui.button(label="🛡 Defend  (store roll + halve damage)", style=discord.ButtonStyle.secondary, row=0)
-    async def defend_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        s = self.session
-        if interaction.user.id != s.player.id:
-            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
-        base = random.randint(1, 6); s.stored += base; s.p_defend = True
-        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
-        self.stop()
-        await interaction.response.send_message(
-            f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Incoming damage halved this turn.\n"
-            f"📦 Stored roll: **{s.stored}pt** carries into your next dice roll."
-        )
-        await s.refresh_pins()
-        await run_enemy_turn(interaction.channel, s)
 
     @discord.ui.button(label="📊 Status", style=discord.ButtonStyle.secondary, row=0)
     async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -689,6 +659,15 @@ class MoveView(discord.ui.View):
         exec_btn.callback = self._execute_cb
         self.add_item(exec_btn)
 
+        defend_btn = discord.ui.Button(
+            label="🛡 Defend  (store roll + halve damage)",
+            style=discord.ButtonStyle.secondary,
+            custom_id="mv_defend",
+            row=2
+        )
+        defend_btn.callback = self._defend_cb
+        self.add_item(defend_btn)
+
         status_btn = discord.ui.Button(
             label="📊 Status",
             style=discord.ButtonStyle.secondary,
@@ -714,6 +693,25 @@ class MoveView(discord.ui.View):
                 view=self
             )
         return cb
+
+    async def _defend_cb(self, interaction: discord.Interaction):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        # Cancel any queued moves — defending ends the turn
+        s.queue = []
+        base = random.randint(1, 6); s.stored += base; s.p_defend = True
+        faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+        self.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Damage halved this turn.\n"
+                f"📦 Stored roll: **{s.stored}pt** carries into your next dice roll."
+            ),
+            view=None
+        )
+        await s.refresh_pins()
+        await run_enemy_turn(interaction.channel, s)
 
     async def _status_cb(self, interaction: discord.Interaction):
         s = self.session
