@@ -141,6 +141,22 @@ async def send_temp(ch,content,delay=4.0):
     try: msg=await ch.send(content); await asyncio.sleep(delay); await msg.delete()
     except: pass
 
+async def bulk_delete(ch,msgs):
+    """Delete a list of messages, using bulk delete where possible."""
+    if not msgs: return
+    try:
+        valid=[m for m in msgs if m is not None]
+        if len(valid)>=2:
+            await ch.delete_messages(valid)
+        else:
+            for m in valid:
+                try: await m.delete()
+                except: pass
+    except Exception:
+        for m in msgs:
+            try: await m.delete()
+            except: pass
+
 def slot_card(slot,row):
     if row:
         cls=CLASSES.get(row.get("class_key",""),{})
@@ -948,6 +964,7 @@ class IWFSession:
         self.player=player; self.char_name=char_name; self.char_class=char_class
         self.enemy_key=enemy_key; self.enemy=IWF_ENEMIES[enemy_key]
         self.p_hp=IWF_MAX_HP; self.e_hp=IWF_MAX_HP; self.round=1; self.pinned=None
+        self.battle_msgs=[]   # track all messages sent during battle for cleanup
     async def refresh(self,title="Ice Wind & Fire"):
         if self.pinned:
             try: await self.pinned.edit(embed=iwf_battle_em(self.char_name,self.char_class["name"],self.char_class["gif"],self.p_hp,self.enemy["name"],self.enemy["element"].capitalize(),self.enemy["gif"],self.e_hp,self.round,title=title))
@@ -968,8 +985,16 @@ async def iwf_end_pve(ch,s,sk,iwf_sessions):
     if s.p_hp<=0: title="Defeated!"; desc=random.choice(IWF_LOSE); color=0xe05050
     elif s.e_hp<=0: title="Victory!"; desc=random.choice(IWF_WIN); color=0x50e090
     else: title="Draw!"; desc="10 rounds — no winner!"; color=0xf0d060
-    await s.refresh(title); await ch.send(embed=discord.Embed(title=title,description=desc,color=color))
-    await asyncio.sleep(2)
+    await s.refresh(title)
+    result_msg=await ch.send(embed=discord.Embed(title=title,description=desc,color=color))
+    await asyncio.sleep(3)
+    # Bulk delete all battle messages (pinned card + all round prompts/reveals)
+    to_delete=[m for m in s.battle_msgs if m is not None]
+    to_delete.append(result_msg)
+    await bulk_delete(ch,to_delete)
+    # Unpin the battle card
+    try: await s.pinned.unpin()
+    except: pass
     em2=discord.Embed(title="Choose Next Opponent",color=0x2a55c0)
     for k,e in IWF_ENEMIES.items(): em2.add_field(name=e["name"],value=e["desc"],inline=False)
     await ch.send(embed=em2,view=IWFEnemyView(sk,iwf_sessions,ch))
@@ -1007,9 +1032,12 @@ class IWFPickView(discord.ui.View):
             elif out=="b": s.p_hp-=1; result=f"**{s.enemy['name']}** wins! {flavor}"
             else: result=f"Tie! {flavor}"
             msg=await i.followup.send(f"**Round {s.round}!**\n{s.char_name}: {ELEMENTS[pp]['emoji']} **{pp.capitalize()}**\n{s.enemy['name']}: {ELEMENTS[ep]['emoji']} **{ep.capitalize()}**\n\n{result}")
+            s.battle_msgs.append(msg)
             s.round+=1; await s.refresh(); await asyncio.sleep(4); await msg.delete()
             if s.p_hp<=0 or s.e_hp<=0 or s.round>IWF_ROUNDS: await iwf_end_pve(i.channel,s,self.sk,self.iwf_sessions)
-            else: await i.channel.send(f"Round {s.round} — Pick:",view=IWFPickView(s,self.sk,self.iwf_sessions,i.channel))
+            else:
+                next_msg=await i.channel.send(f"Round {s.round} — Pick:",view=IWFPickView(s,self.sk,self.iwf_sessions,i.channel))
+                s.battle_msgs.append(next_msg)
         return cb
 
 class IWFDuelPickView(discord.ui.View):
@@ -1063,9 +1091,12 @@ class IWFEnemyView(discord.ui.View):
             s=IWFSession(i.user,cn,cc,key); self.iwf_sessions[self.sk]=s
             em=iwf_battle_em(s.char_name,s.char_class["name"],s.char_class["gif"],s.p_hp,e["name"],e["element"].capitalize(),e["gif"],s.e_hp,s.round,title=f"{s.char_name} vs {e['name']}",footer=e["desc"])
             msg=await self.ch.send(embed=em)
+            s.battle_msgs.append(msg)
             try: await msg.pin()
             except: pass
-            s.pinned=msg; await self.ch.send(f"Round 1 — Pick your element:",view=IWFPickView(s,self.sk,self.iwf_sessions,self.ch))
+            s.pinned=msg
+            pick_msg=await self.ch.send(f"Round 1 — Pick your element:",view=IWFPickView(s,self.sk,self.iwf_sessions,self.ch))
+            s.battle_msgs.append(pick_msg)
         return cb
 
 class IWFClassView(discord.ui.View):
@@ -1117,19 +1148,6 @@ class IceWindFire(commands.Cog):
     @commands.command(name="FFQ")
     async def start_iwf(self,ctx,opponent:discord.Member=None):
         if opponent: await self._duel(ctx,opponent); return
-        guild=ctx.guild; category=guild.get_channel(FF_CATEGORY_ID)
-        if ctx.author.id in self.iwf_channels:
-            ch=self.bot.get_channel(self.iwf_channels[ctx.author.id])
-            if ch: await ctx.send(f"{ctx.author.mention} Your IWF arena: {ch.mention}"); return
-        expected=f"iwf-{ctx.author.name.lower().replace(' ','-')}"; existing=None
-        if category:
-            for ch in category.text_channels:
-                if ch.name==expected: existing=ch; break
-        ow={guild.default_role:discord.PermissionOverwrite(view_channel=True,send_messages=False),ctx.author:discord.PermissionOverwrite(view_channel=True,send_messages=True),guild.me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True)}
-        if existing: game_channel=existing; self.iwf_channels[ctx.author.id]=game_channel.id; await ctx.send(f"{ctx.author.mention} Welcome back to Ice Wind & Fire! {game_channel.mention}")
-        else:
-            game_channel=await guild.create_text_channel(name=expected,category=category,overwrites=ow,topic=f"IWF — {ctx.author.display_name}")
-            self.iwf_channels[ctx.author.id]=game_channel.id; await ctx.send(f"{ctx.author.mention} Your Ice Wind & Fire arena: {game_channel.mention}")
         await self._db_ensure(ctx.author.id)
         saves=await self._db_get_saves(ctx.author.id,"iwf")
         em=discord.Embed(title="🧊🌪🔥 Ice Wind & Fire — Select Slot",color=0x1a3a8a)
@@ -1139,11 +1157,10 @@ class IceWindFire(commands.Cog):
             if row: cls=IWF_CLASSES.get(row.get("class_key",""),{}); se=discord.Embed(title=f"📁 Slot {slot} — {row.get('char_name','?')}",color=0x2a55c0); se.set_thumbnail(url=ASSET_BASE_URL+cls.get("gif","")); se.add_field(name="Class",value=cls.get("name","?"),inline=True)
             else: se=discord.Embed(title=f"📁 Slot {slot} — Empty",color=0x2a2a4a)
             slot_ems.append(se)
-        await game_channel.send(embeds=[em]+slot_ems,view=IWFSlotView(ctx.author.id,saves,game_channel,guild,self.iwf_sessions,self.iwf_saves))
+        await ctx.send(embeds=[em]+slot_ems,view=IWFSlotView(ctx.author.id,saves,ctx.channel,ctx.guild,self.iwf_sessions,self.iwf_saves))
 
     @commands.command(name="ffqname")
     async def set_name(self,ctx,*,char_name:str):
-        if ctx.channel.id not in self.iwf_channels.values(): return
         uid=ctx.author.id
         key=next(((u,s) for(u,s),v in self.iwf_saves.items() if u==uid and isinstance(v,dict) and v.get("char_name")==""),None)
         if not key: await ctx.send("No pending character — type !FFQ to start."); return
