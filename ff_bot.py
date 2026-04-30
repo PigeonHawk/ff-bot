@@ -636,15 +636,15 @@ class RollAgainView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.defer()
         base  = random.randint(1, 6); total = base + s.stored; s.stored = 0
         s.pts_left = s.pts_total = total
         faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
         note  = f" (+{total - base} stored) = **{total}**" if total > base else ""
         self.stop()
-        await interaction.response.send_message(
+        msg = await interaction.followup.send(
             f"{faces[base-1]} **{interaction.user.display_name}** rolled **{base}**{note}! **{s.pts_left}pt** to spend."
         )
-        msg = await interaction.original_response()
         await s.refresh_pins()
         await asyncio.sleep(3.0)
         await msg.delete()
@@ -665,11 +665,12 @@ class RollAgainView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         s.phase = "select_enemy"; s.enemy = None; s.queue = []; s.pinned_player = None; s.pinned_enemy = None
         s.unlocked_hard = await db_get_hard_unlocked(interaction.user.id)
         em = discord.Embed(title="⚔ Battle Stopped", description="Choose your next opponent.", color=0x2a55c0)
-        await interaction.response.send_message(embed=em, view=FightMenuView(s))
+        await interaction.followup.send(embed=em, view=FightMenuView(s))
 
 
 async def end_pve(channel, s: GameSession, won: bool):
@@ -742,11 +743,11 @@ class FightMenuView(discord.ui.View):
             s = self.session
             if interaction.user.id != s.player.id:
                 await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+            await interaction.response.defer()
             self.stop()
             s.reset_for_battle(key, hard=hard)
             mode_tag = "  🔴 HARD MODE" if hard else ""
-            await interaction.response.send_message(f"═══════  ⚔ BATTLE START{mode_tag}  ═══════")
-            banner = await interaction.original_response()
+            banner = await interaction.followup.send(f"═══════  ⚔ BATTLE START{mode_tag}  ═══════")
             ch = interaction.channel
             p_msg = await ch.send(embed=pve_player_card(s))
             e_msg = await ch.send(embed=pve_enemy_card(s))
@@ -786,15 +787,15 @@ class RollView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.defer()
         base  = random.randint(1, 6); total = base + s.stored; s.stored = 0
         s.pts_left = s.pts_total = total
         faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
         note  = f" (+{total - base} stored) = **{total}**" if total > base else ""
         self.stop()
-        await interaction.response.send_message(
+        msg = await interaction.followup.send(
             f"{faces[base-1]} **{interaction.user.display_name}** rolled **{base}**{note}! **{s.pts_left}pt** to spend."
         )
-        msg = await interaction.original_response()
         await s.refresh_pins()
         await asyncio.sleep(3.0)
         await msg.delete()
@@ -815,11 +816,12 @@ class RollView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         s.phase = "select_enemy"; s.enemy = None; s.queue = []; s.pinned_player = None; s.pinned_enemy = None
         s.unlocked_hard = await db_get_hard_unlocked(interaction.user.id)
         em = discord.Embed(title="⚔ Battle Stopped", description="Choose your next opponent.", color=0x2a55c0)
-        await interaction.response.send_message(embed=em, view=FightMenuView(s))
+        await interaction.followup.send(embed=em, view=FightMenuView(s))
 
 
 class MoveView(discord.ui.View):
@@ -924,11 +926,12 @@ class MoveView(discord.ui.View):
                 await interaction.response.send_message("This is not your battle!", ephemeral=True); return
             if s.pts_left < cost:
                 await interaction.response.send_message(f"Not enough points!", ephemeral=True); return
+            await interaction.response.defer()
             s.pts_left -= cost; s.queue.append(key)
             await s.refresh_pins()
             self._rebuild()
             queue_str = " → ".join(q.capitalize() for q in s.queue)
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=f"✅ **{key.capitalize()}** queued! [{queue_str}] — **{s.pts_left}pt** left",
                 view=self
             )
@@ -942,6 +945,7 @@ class MoveView(discord.ui.View):
             await interaction.response.send_message("Not enough points! (costs 3pt)", ephemeral=True); return
         if not s.lb_ready or s.lb_used:
             await interaction.response.send_message("Limit Break not available!", ephemeral=True); return
+        await interaction.response.defer()
         s.pts_left -= 3
         s.lb_ready  = False
         s.lb_used   = True
@@ -965,8 +969,7 @@ class MoveView(discord.ui.View):
         else:                                    # Generic — atk_boost
             s.lb_boost_next  = True
             msg = f"⚡ **LIMIT BREAK — {lb_def['name']}!**\n💥 Next attack deals **3× damage**!"
-        await interaction.response.edit_message(content=msg, view=None)
-        lb_resp = await interaction.original_response()
+        lb_resp = await interaction.followup.send(content=msg)
         await s.refresh_pins()
         await asyncio.sleep(4.0)
         await lb_resp.delete()
@@ -979,19 +982,18 @@ class MoveView(discord.ui.View):
         s = self.session
         if interaction.user.id != s.player.id:
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        await interaction.response.defer()
         # Cancel any queued moves — defending ends the turn
         s.queue = []
         base = random.randint(1, 6); s.stored += base; s.p_defend = True
         faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
         self.stop()
-        await interaction.response.edit_message(
+        msg = await interaction.followup.send(
             content=(
                 f"🛡 {faces[base-1]} **Defend!** Rolled **{base}** — stored for next turn. Damage halved this turn.\n"
                 f"📦 Stored roll: **{s.stored}pt** carries into your next dice roll."
-            ),
-            view=None
+            )
         )
-        msg = await interaction.original_response()
         await s.refresh_pins()
         await asyncio.sleep(4.0)
         await msg.delete()
@@ -1012,6 +1014,7 @@ class MoveView(discord.ui.View):
             await interaction.response.send_message("This is not your battle!", ephemeral=True); return
         if not s.queue:
             await interaction.response.send_message("Nothing queued!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         lines = []
         for mk in s.queue:
@@ -1033,8 +1036,7 @@ class MoveView(discord.ui.View):
                 if m["effect"] == "poison": s.e_poison = 3; lines.append(f"☠ **Poison** inflicted on {s.enemy['name']}!")
                 elif m["effect"] == "regen": s.p_regen = 3; lines.append("♻ **Regen** granted!")
         s.queue = []
-        await interaction.response.edit_message(content="\n".join(lines), view=None)
-        msg = await interaction.original_response()
+        msg = await interaction.followup.send("\n".join(lines))
         await s.refresh_pins()
         await asyncio.sleep(4.0)
         await msg.delete()
@@ -1071,18 +1073,26 @@ class DuelMoveView(discord.ui.View):
             if interaction.user.id != duel.current_player().id:
                 await interaction.response.send_message(
                     f"It's not your turn! Waiting for **{duel.current_player().display_name}**.", ephemeral=True); return
+            await interaction.response.defer()
             attacker = "challenger" if interaction.user.id == duel.challenger.id else "opponent"
             log = duel.apply_move(move_key, attacker)
             self.stop()
-            await interaction.response.edit_message(content=log, view=None)
+            msg = await interaction.followup.send(content=log)
+            await asyncio.sleep(3.0)
+            await msg.delete()
             await duel.refresh_pins()
             winner_side = duel.is_over()
             if winner_side:
                 await end_duel(interaction.channel, duel, winner_side); return
             if duel.turn == "opponent":
                 tick = duel.tick_status()
-                if tick: await interaction.channel.send("\n".join(tick))
-                await duel.refresh_pins()
+                if tick:
+                    tick_msg = await interaction.channel.send("\n".join(tick))
+                    await duel.refresh_pins()
+                    await asyncio.sleep(3.0)
+                    await tick_msg.delete()
+                else:
+                    await duel.refresh_pins()
                 winner_side = duel.is_over()
                 if winner_side:
                     await end_duel(interaction.channel, duel, winner_side); return
@@ -1121,6 +1131,7 @@ class SaveSlotView(discord.ui.View):
         async def cb(interaction: discord.Interaction):
             if interaction.user.id != self.uid:
                 await interaction.response.send_message("This isn't your save file!", ephemeral=True); return
+            await interaction.response.defer()
             self.stop()
             row = self.saves[slot]
             if row:
@@ -1133,13 +1144,13 @@ class SaveSlotView(discord.ui.View):
                 em.add_field(name="Zodiac",value=row["zodiac"] or "—",   inline=True)
                 bal = await db_get_gil(self.uid)
                 em.add_field(name="Gil",   value=f"💰 {bal} gil",         inline=True)
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     embed=em,
                     view=ContinueOrNewView(self.uid, slot, row, self.channel),
                 )
             else:
                 # Empty slot — go straight to character creation
-                await interaction.response.send_message(f"📁 **Slot {slot}** — Starting new character!")
+                await interaction.followup.send(f"📁 **Slot {slot}** — Starting new character!")
                 session = active_sessions.get(self.channel.id)
                 if session: session._pending_slot = slot
                 await send_class_select(self.channel, slot)
@@ -1159,6 +1170,7 @@ class ContinueOrNewView(discord.ui.View):
     async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.uid:
             await interaction.response.send_message("This isn't your save!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         row      = self.row
         cls      = CLASSES.get(row["class_key"])
@@ -1177,14 +1189,15 @@ class ContinueOrNewView(discord.ui.View):
         em.add_field(name="Zodiac",value=row["zodiac"] or "—", inline=True)
         em.add_field(name="Gil",   value=f"💰 {bal} gil",       inline=True)
         em.set_footer(text=f"Save Slot {self.slot}  |  !fight to battle  |  !ffreset to reset")
-        await interaction.response.send_message(embed=em)
+        await interaction.followup.send(embed=em)
 
     @discord.ui.button(label="🔄 New Game (overwrites this slot)", style=discord.ButtonStyle.danger, row=0)
     async def new_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.uid:
             await interaction.response.send_message("This isn't your save!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚠️ This will **delete** Slot {self.slot} — **{self.row['char_name']}**. Are you sure?",
             view=ConfirmOverwriteView(self.uid, self.slot, self.channel)
         )
@@ -1193,10 +1206,11 @@ class ContinueOrNewView(discord.ui.View):
     async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.uid:
             await interaction.response.send_message("This isn't your save!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         saves = await db_get_saves(self.uid)
         em = discord.Embed(title="📁 Select Save Slot", description="Pick a slot to continue or start fresh.", color=0x2a55c0)
-        await interaction.response.send_message(embed=em, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
+        await interaction.followup.send(embed=em, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
 
 
 class ConfirmOverwriteView(discord.ui.View):
@@ -1211,19 +1225,21 @@ class ConfirmOverwriteView(discord.ui.View):
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.uid:
             await interaction.response.send_message("This isn't your save!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         await db_delete_save(self.uid, self.slot)
-        await interaction.response.send_message(f"🗑 Slot {self.slot} cleared! Starting new character...")
+        await interaction.followup.send(f"🗑 Slot {self.slot} cleared! Starting new character...")
         await send_class_select(self.channel, self.slot)
 
     @discord.ui.button(label="✗ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.uid:
             await interaction.response.send_message("This isn't your save!", ephemeral=True); return
+        await interaction.response.defer()
         self.stop()
         saves = await db_get_saves(self.uid)
         em = discord.Embed(title="📁 Select Save Slot", color=0x2a55c0)
-        await interaction.response.send_message(embed=em, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
+        await interaction.followup.send(embed=em, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
 
 # ─────────────────────────────────────────────
 #  BOT SETUP
@@ -1477,6 +1493,141 @@ async def show_gil(ctx: commands.Context):
     em   = discord.Embed(title="💰 Gil Balance", description=f"**{name}** has **{bal} gil**", color=0xf0d060)
     em.set_footer(text=f"PvE win: +{GIL_WIN_PVE} gil  |  Hard win: +{GIL_WIN_PVE*2} gil  |  Duel win: +{GIL_WIN_DUEL} gil  |  Duel loss: -{GIL_LOSE_DUEL} gil")
     await ctx.send(embed=em)
+
+# ─────────────────────────────────────────────
+#  !titlescreen — pause and return to slot select
+# ─────────────────────────────────────────────
+@bot.command(name="titlescreen")
+async def titlescreen(ctx: commands.Context):
+    if not _is_game_channel(ctx): return
+    if ctx.author.id not in player_channels or player_channels[ctx.author.id] != ctx.channel.id:
+        await ctx.send("You can only do this from your own FF Arena channel."); return
+    cid = ctx.channel.id
+    # Pause — cleanly stop any active duel
+    if cid in active_duels:
+        duel = active_duels[cid]
+        try: await ctx.channel.set_permissions(duel.opponent, overwrite=None)
+        except Exception: pass
+        del active_duels[cid]
+    if ctx.author.id in pending_duels:
+        del pending_duels[ctx.author.id]
+    # Pause the session but keep it in memory tagged as paused
+    if cid in active_sessions:
+        active_sessions[cid].phase = "paused"
+        active_sessions[cid].queue = []
+        active_sessions[cid].pinned_player = None
+        active_sessions[cid].pinned_enemy  = None
+    saves = await db_get_saves(ctx.author.id)
+    bal   = await db_get_gil(ctx.author.id)
+    em = discord.Embed(
+        title="🎮 Title Screen",
+        description=(
+            f"💰 Gil: **{bal}**\n\nYour progress is saved. Pick a slot to continue or switch characters."
+        ),
+        color=0x1a3a8a
+    )
+    for slot, row in saves.items():
+        if row:
+            cls = CLASSES.get(row["class_key"], {})
+            em.add_field(
+                name=f"📁 Slot {slot} — {row['char_name']}",
+                value=f"Class: {cls.get('name', '?')}",
+                inline=False
+            )
+        else:
+            em.add_field(name=f"📁 Slot {slot} — Empty", value="Start a new adventure", inline=False)
+    em.set_footer(text="Select a slot below to continue")
+    await ctx.send(embed=em, view=TitleScreenView(ctx.author.id, saves, ctx.guild, ctx.channel))
+
+
+class TitleScreenView(discord.ui.View):
+    """Title screen slot picker — Resume current slot or switch."""
+    def __init__(self, uid: int, saves: dict, guild: discord.Guild, channel: discord.TextChannel):
+        super().__init__(timeout=300)
+        self.uid     = uid
+        self.saves   = saves
+        self.guild   = guild
+        self.channel = channel
+        for slot in (1, 2, 3):
+            row  = saves[slot]
+            if row:
+                cls   = CLASSES.get(row["class_key"], {})
+                label = f"▶ Slot {slot} — {row['char_name']} ({cls.get('name','?')})"
+                style = discord.ButtonStyle.primary
+            else:
+                label = f"✦ Slot {slot} — New Game"
+                style = discord.ButtonStyle.secondary
+            btn = discord.ui.Button(label=label, style=style, custom_id=f"title_slot_{slot}", row=0)
+            btn.callback = self._make_cb(slot)
+            self.add_item(btn)
+
+    def _make_cb(self, slot: int):
+        async def cb(interaction: discord.Interaction):
+            if interaction.user.id != self.uid:
+                await interaction.response.send_message("This isn't your save!", ephemeral=True); return
+            await interaction.response.defer()
+            self.stop()
+            row = self.saves[slot]
+            cid = self.channel.id
+            if row:
+                # Load this slot into session
+                cls     = CLASSES.get(row["class_key"])
+                if not cls:
+                    await interaction.followup.send("Save data invalid — please start a new game.", ephemeral=True); return
+                session = GameSession(interaction.user, cls, row["char_name"], row["zodiac"] or "")
+                session.unlocked_hard = await db_get_hard_unlocked(self.uid)
+                session._save_slot    = slot
+                active_sessions[cid] = session
+                bal = await db_get_gil(self.uid)
+                em = discord.Embed(title=f"▶ Resuming Slot {slot}", color=0xf0d060)
+                em.set_image(url=ASSET_BASE_URL + cls["gif"])
+                em.add_field(name="Name",   value=row["char_name"],       inline=True)
+                em.add_field(name="Class",  value=cls["name"],            inline=True)
+                em.add_field(name="Zodiac", value=row["zodiac"] or "—",   inline=True)
+                em.add_field(name="Gil",    value=f"💰 {bal} gil",         inline=True)
+                em.set_footer(text="!fight to battle  |  !titlescreen to return here")
+                await interaction.followup.send(embed=em)
+            else:
+                # Empty slot — start new character
+                _pending_slots[cid] = slot
+                await interaction.followup.send(f"📁 **Slot {slot}** — Starting new character!")
+                await send_class_select(self.channel, slot)
+        return cb
+
+
+# ─────────────────────────────────────────────
+#  !ffslot — switch save slot without wiping
+# ─────────────────────────────────────────────
+@bot.command(name="ffslot")
+async def ffslot(ctx: commands.Context):
+    if not _is_game_channel(ctx): return
+    if ctx.author.id not in player_channels or player_channels[ctx.author.id] != ctx.channel.id:
+        await ctx.send("You can only switch slots from your own FF Arena channel."); return
+    # Cancel any active battle/duel cleanly but keep the session data
+    cid = ctx.channel.id
+    if cid in active_duels:
+        duel = active_duels[cid]
+        try: await ctx.channel.set_permissions(duel.opponent, overwrite=None)
+        except Exception: pass
+        del active_duels[cid]
+    if ctx.author.id in pending_duels:
+        del pending_duels[ctx.author.id]
+    if cid in active_sessions:
+        del active_sessions[cid]
+    saves = await db_get_saves(ctx.author.id)
+    em = discord.Embed(
+        title="📁 Switch Save Slot",
+        description="Pick a slot to load or start a new character.",
+        color=0x2a55c0
+    )
+    for slot, row in saves.items():
+        if row:
+            cls = CLASSES.get(row["class_key"], {})
+            em.add_field(name=f"Slot {slot} — {row['char_name']}", value=f"Class: {cls.get('name','?')}", inline=False)
+        else:
+            em.add_field(name=f"Slot {slot} — Empty", value="Start a new adventure", inline=False)
+    await ctx.send(embed=em, view=SaveSlotView(ctx.author.id, saves, ctx.guild, ctx.channel))
+
 
 # ─────────────────────────────────────────────
 #  !ffreset
