@@ -64,9 +64,15 @@ async def init_db():
     async with db_pool.acquire() as c:
         await c.execute("""CREATE TABLE IF NOT EXISTS players(user_id BIGINT PRIMARY KEY,gil INTEGER NOT NULL DEFAULT 200,hard_unlocked TEXT NOT NULL DEFAULT '')""")
         await c.execute("""CREATE TABLE IF NOT EXISTS save_slots(user_id BIGINT NOT NULL,slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3),class_key TEXT,char_name TEXT,zodiac TEXT,game TEXT NOT NULL DEFAULT 'ff',PRIMARY KEY(user_id,slot,game))""")
-    # Migrate existing table — add game column if missing
+    # Migrate existing table
     async with db_pool.acquire() as c:
         await c.execute("ALTER TABLE save_slots ADD COLUMN IF NOT EXISTS game TEXT NOT NULL DEFAULT 'ff'")
+        # Fix primary key to include game column if not already done
+        try:
+            await c.execute("ALTER TABLE save_slots DROP CONSTRAINT IF EXISTS save_slots_pkey")
+            await c.execute("ALTER TABLE save_slots ADD PRIMARY KEY (user_id, slot, game)")
+        except Exception:
+            pass
     print("Database ready.")
 
 async def db_ensure(uid):
@@ -108,7 +114,7 @@ async def db_get_saves(uid,game="ff"):
 async def db_save_char(uid,slot,class_key,char_name,zodiac="",game="ff"):
     if not db_pool: return
     async with db_pool.acquire() as c:
-        await c.execute("INSERT INTO save_slots(user_id,slot,class_key,char_name,zodiac,game) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(user_id,slot,game) DO UPDATE SET class_key=$3,char_name=$4,zodiac=$5",uid,slot,class_key,char_name,zodiac,game)
+        await c.execute("INSERT INTO save_slots(user_id,slot,class_key,char_name,zodiac,game) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(user_id,slot) DO UPDATE SET class_key=$3,char_name=$4,zodiac=$5,game=$6",uid,slot,class_key,char_name,zodiac,game)
 
 async def db_del_save(uid,slot,game="ff"):
     if not db_pool: return
