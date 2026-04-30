@@ -1121,10 +1121,11 @@ class IWFClassView(discord.ui.View):
             await i.followup.send(embed=em)
             char_name=cls["name"]  # use class name as default
             self.iwf_saves[(self.uid,self.slot)]={"class_key":key,"char_name":char_name,"class":cls}
-            await db_save_char(self.uid,self.slot,key,char_name,game="iwf")
             self.iwf_sessions[(self.uid,self.slot)]=self.iwf_saves[(self.uid,self.slot)]
+            try: await db_save_char(self.uid,self.slot,key,char_name,game="iwf")
+            except Exception as e: print(f"IWF save error (non-fatal): {e}")
             em2=discord.Embed(title="Choose Your Opponent",color=0x2a55c0)
-            for k,e in IWF_ENEMIES.items(): em2.add_field(name=e["name"],value=e["desc"],inline=False)
+            for k,e_ in IWF_ENEMIES.items(): em2.add_field(name=e_["name"],value=e_["desc"],inline=False)
             await self.ch.send(embed=em2,view=IWFEnemyView((self.uid,self.slot),self.iwf_sessions,self.ch))
         return cb
 
