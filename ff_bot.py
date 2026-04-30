@@ -1103,8 +1103,8 @@ class IWFEnemyView(discord.ui.View):
         return cb
 
 class IWFClassView(discord.ui.View):
-    def __init__(self,uid,slot,ch,iwf_sessions,iwf_saves):
-        super().__init__(timeout=120); self.uid=uid; self.slot=slot; self.ch=ch; self.iwf_sessions=iwf_sessions; self.iwf_saves=iwf_saves
+    def __init__(self,uid,slot,ch,iwf_sessions,iwf_saves,db_save=None):
+        super().__init__(timeout=120); self.uid=uid; self.slot=slot; self.ch=ch; self.iwf_sessions=iwf_sessions; self.iwf_saves=iwf_saves; self._db_save=db_save
         for key,cls in IWF_CLASSES.items():
             b=discord.ui.Button(label=f"{cls['name']} ({cls['role']})",style=discord.ButtonStyle.primary,custom_id=f"iwfc_{key}"); b.callback=self._cb(key,cls); self.add_item(b)
     def _cb(self,key,cls):
@@ -1113,8 +1113,13 @@ class IWFClassView(discord.ui.View):
             await i.response.defer(); self.stop()
             em=discord.Embed(title=f"Class: {cls['name']}",color=0x2a55c0); em.set_image(url=ASSET_BASE_URL+cls["gif"])
             await i.followup.send(embed=em)
-            self.iwf_saves[(self.uid,self.slot)]={"class_key":key,"char_name":"","class":cls}
-            await self.ch.send("Now type your character name: `!ffqname YourName`")
+            char_name=cls["name"]  # use class name as default
+            self.iwf_saves[(self.uid,self.slot)]={"class_key":key,"char_name":char_name,"class":cls}
+            await db_save_char(self.uid,self.slot,key,char_name,game="iwf")
+            self.iwf_sessions[(self.uid,self.slot)]=self.iwf_saves[(self.uid,self.slot)]
+            em2=discord.Embed(title="Choose Your Opponent",color=0x2a55c0)
+            for k,e in IWF_ENEMIES.items(): em2.add_field(name=e["name"],value=e["desc"],inline=False)
+            await self.ch.send(embed=em2,view=IWFEnemyView((self.uid,self.slot),self.iwf_sessions,self.ch))
         return cb
 
 class IWFSlotView(discord.ui.View):
@@ -1139,7 +1144,7 @@ class IWFSlotView(discord.ui.View):
                 await self.ch.send(embed=em2,view=IWFEnemyView(key,self.iwf_sessions,self.ch))
             else:
                 await i.followup.send(f"Slot {slot} — Choose your class:")
-                await self.ch.send(embed=discord.Embed(title="Choose Class",color=0x2a55c0),view=IWFClassView(self.uid,slot,self.ch,self.iwf_sessions,self.iwf_saves))
+                await self.ch.send(embed=discord.Embed(title="Choose Class",color=0x2a55c0),view=IWFClassView(self.uid,slot,self.ch,self.iwf_sessions,self.iwf_saves,self._db_save if hasattr(self,"_db_save") else None))
         return cb
 
 class IceWindFire(commands.Cog):
