@@ -1038,7 +1038,8 @@ async def iwf_end_pve(ch,s,sk,iwf_sessions):
     except: pass
     em2=discord.Embed(title="Choose Next Opponent",color=0x2a55c0)
     for k,e in IWF_ENEMIES.items(): em2.add_field(name=e["name"],value=e["desc"],inline=False)
-    await ch.send(embed=em2,view=IWFEnemyView(sk,iwf_sessions,ch))
+    ev=IWFEnemyView(sk,iwf_sessions,ch)
+    ev.msg=await ch.send(embed=em2,view=ev)
 
 async def iwf_end_duel(d,iwf_duels):
     d.active=False
@@ -1127,7 +1128,7 @@ class IWFDuelPickView(discord.ui.View):
 
 class IWFEnemyView(discord.ui.View):
     def __init__(self,sk,iwf_sessions,ch):
-        super().__init__(timeout=120); self.sk=sk; self.iwf_sessions=iwf_sessions; self.ch=ch
+        super().__init__(timeout=120); self.sk=sk; self.iwf_sessions=iwf_sessions; self.ch=ch; self.msg=None
         for key,e in IWF_ENEMIES.items():
             b=discord.ui.Button(label=f"Fight {e['name']}",style=discord.ButtonStyle.danger,custom_id=f"iwfe_{key}"); b.callback=self._cb(key,e); self.add_item(b)
     def _cb(self,key,e):
@@ -1135,11 +1136,18 @@ class IWFEnemyView(discord.ui.View):
             uid,slot=self.sk
             if i.user.id!=uid: await i.response.send_message("Not your game!",ephemeral=True); return
             await i.response.defer(); self.stop()
+            # Delete the enemy select message
+            if self.msg:
+                try: await self.msg.delete()
+                except: pass
             save=self.iwf_sessions.get(self.sk)
             if not save: await i.followup.send("Session expired — type !FFQ",ephemeral=True); return
             cn=save["char_name"] if isinstance(save,dict) else save.char_name
             cc=save["class"] if isinstance(save,dict) else save.char_class
             s=IWFSession(i.user,cn,cc,key); self.iwf_sessions[self.sk]=s
+            # Delete the enemy select message
+            try: await i.message.delete()
+            except: pass
             p_em,e_em=iwf_battle_ems(s.char_name,s.char_class["name"],s.char_class["gif"],s.p_hp,e["name"],e["element"].capitalize(),e["gif"],s.e_hp,s.round,footer=e["desc"])
             pm=await self.ch.send(embed=p_em); em_=await self.ch.send(embed=e_em)
             s.battle_msgs.extend([pm,em_])
@@ -1205,16 +1213,23 @@ class IceWindFire(commands.Cog):
     @commands.command(name="FFQ")
     async def start_iwf(self,ctx,opponent:discord.Member=None):
         if opponent: await self._duel(ctx,opponent); return
-        await self._db_ensure(ctx.author.id)
-        saves=await self._db_get_saves(ctx.author.id,"iwf")
-        em=discord.Embed(title="🧊🌪🔥 Ice Wind & Fire — Select Slot",color=0x1a3a8a)
-        slot_ems=[]
-        for slot in(1,2,3):
-            row=saves.get(slot)
-            if row: cls=IWF_CLASSES.get(row.get("class_key",""),{}); se=discord.Embed(title=f"📁 Slot {slot} — {row.get('char_name','?')}",color=0x2a55c0); se.set_thumbnail(url=ASSET_BASE_URL+cls.get("gif","")); se.add_field(name="Class",value=cls.get("name","?"),inline=True)
-            else: se=discord.Embed(title=f"📁 Slot {slot} — Empty",color=0x2a2a4a)
-            slot_ems.append(se)
-        await ctx.send(embeds=[em]+slot_ems,view=IWFSlotView(ctx.author.id,saves,ctx.channel,ctx.guild,self.iwf_sessions,self.iwf_saves))
+        uid=ctx.author.id
+        # Check if player already has an active IWF session this message
+        existing=next(((u,s) for(u,s),v in self.iwf_sessions.items() if u==uid and isinstance(v,IWFSession)),None)
+        if existing:
+            # Already has a character — go straight to enemy select
+            key=existing; s=self.iwf_sessions[key]
+            em=discord.Embed(title="👹 Choose Your Opponent",color=0x2a55c0)
+            for k,e in IWF_ENEMIES.items(): em.add_field(name=e["name"],value=e["desc"],inline=False)
+            ev=IWFEnemyView(key,self.iwf_sessions,ctx.channel)
+            ev.msg=await ctx.send(embed=em,view=ev)
+            return
+        # New player — go straight to class select (slot 1 used internally, no UI)
+        key=(uid,1); self.iwf_sessions[key]=None
+        em=discord.Embed(title="🧊🌪🔥 Ice Wind & Fire — Choose Your Class",color=0x1a3a8a)
+        for k,cls in IWF_CLASSES.items():
+            em.add_field(name=cls["name"],value=cls["role"],inline=True)
+        await ctx.send(embed=em,view=IWFClassView(uid,1,ctx.channel,self.iwf_sessions,self.iwf_saves,self._db_save))
 
     @commands.command(name="ffqname")
     async def set_name(self,ctx,*,char_name:str):
