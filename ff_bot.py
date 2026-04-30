@@ -37,14 +37,38 @@ ENEMIES = {
 }
 
 MOVES = {
-    "slash":   {"cost": 1, "type": "atk",    "dmg": (4,  10)},
+    "slash":     {"cost": 1, "type": "atk",    "dmg": (4,  10)},
+    "axeswing":  {"cost": 3, "type": "atk",    "dmg": (16, 26), "class": "warrior"},
+    "poison":    {"cost": 3, "type": "status", "effect": "poison"},
+    "regen":     {"cost": 3, "type": "status", "effect": "regen"},
+    "cure":      {"cost": 4, "type": "heal",   "heal": (12, 20)},
+    "fire":      {"cost": 5, "type": "atk",    "dmg": (14, 22)},
+    "ice":       {"cost": 5, "type": "atk",    "dmg": (14, 22)},
+    "thunder":   {"cost": 5, "type": "atk",    "dmg": (14, 22)},
+}
+
+# Enemy move pool — no Cure, sig damage reduced by ~15-30%
+ENEMY_MOVES = {
+    "slash":   {"cost": 1, "type": "atk"},
     "poison":  {"cost": 3, "type": "status", "effect": "poison"},
     "regen":   {"cost": 3, "type": "status", "effect": "regen"},
-    "cure":    {"cost": 4, "type": "heal",   "heal": (12, 20)},
-    "fire":    {"cost": 5, "type": "atk",    "dmg": (14, 22)},
-    "ice":     {"cost": 5, "type": "atk",    "dmg": (14, 22)},
-    "thunder": {"cost": 5, "type": "atk",    "dmg": (14, 22)},
+    "fire":    {"cost": 5, "type": "atk",    "dmg": (10, 16)},
+    "ice":     {"cost": 5, "type": "atk",    "dmg": (10, 16)},
+    "thunder": {"cost": 5, "type": "atk",    "dmg": (10, 16)},
 }
+
+# Limit break definitions per class
+LIMIT_BREAKS = {
+    "warrior":   {"name": "Shield Wall",        "cost": 3, "type": "defense",
+                  "desc": "Reduces all incoming damage by 25% for 5 turns."},
+    "redmage":   {"name": "Vermilion Scourge",  "cost": 3, "type": "blind",
+                  "desc": "Blinds the enemy — miss rate +40% for 5 turns."},
+    # Generic limit break for all other classes
+    "default":   {"name": "Limit Break",        "cost": 3, "type": "atk_boost",
+                  "desc": "Unleashes raw power — next attack deals 3× damage."},
+}
+
+LB_MAX = 75   # damage received to fill the limit break meter
 
 DUEL_MOVES = {
     "slash":   {"type": "atk",    "dmg": (6,  14)},
@@ -187,11 +211,23 @@ def pve_player_card(s, title="") -> discord.Embed:
     status_val = "\n".join(status_parts) if status_parts else "—"
     pts_line   = f"\n\n🎲 **{s.pts_left}pt** remaining" if s.pts_left else ""
     queue_line = f"\n📋 **{' → '.join(q.capitalize() for q in s.queue)}**" if s.queue else ""
+    # Limit break meter bar
+    lb_pct   = min(s.lb_meter / LB_MAX, 1.0)
+    lb_filled= round(lb_pct * 12)
+    lb_bar   = "█" * lb_filled + "░" * (12 - lb_filled)
+    if s.lb_ready:
+        lb_line = "\n⚡ **LIMIT BREAK READY!** (`" + lb_bar + "` FULL)"
+    else:
+        lb_line = f"\n⚡ Limit `{lb_bar}` {s.lb_meter}/{LB_MAX}"
+    if s.lb_active:
+        lb_key  = next(k for k, v in CLASSES.items() if v is s.chosen_class)
+        lb_def  = LIMIT_BREAKS.get(lb_key, LIMIT_BREAKS["default"])
+        lb_line += f"\n🔥 **{lb_def['name']}** active ({s.lb_turns} turns)"
     em = discord.Embed(title=title or f"⚔ {s.char_name}", color=0x1a3a8a)
     em.set_author(name=f"{s.char_name}  ·  {s.chosen_class['name']}  ·  {s.chosen_class['role']}")
     em.set_image(url=ASSET_BASE_URL + s.chosen_class["gif"])
     em.add_field(name="HP", value=f"`{hp_bar(s.p_hp, s.p_hp_max)}`\n**{s.p_hp} / {s.p_hp_max}**", inline=True)
-    em.add_field(name="Status", value=status_val + pts_line + queue_line, inline=True)
+    em.add_field(name="Status", value=status_val + pts_line + queue_line + lb_line, inline=True)
     em.set_footer(text="Buttons below — Roll dice, pick moves, then Execute")
     return em
 
@@ -245,6 +281,17 @@ class GameSession:
         self.phase         = "select_enemy"
         self.pinned_player = None
         self.pinned_enemy  = None
+        # Limit break
+        self.lb_meter      = 0        # damage accumulated
+        self.lb_ready      = False    # meter full?
+        self.lb_used       = False    # used this battle?
+        self.lb_active     = False    # effect currently running?
+        self.lb_turns      = 0        # turns remaining on LB effect
+        self.lb_boost_next = False    # atk_boost: triple next hit
+        self.e_blinded     = False    # blind on enemy
+        self.e_blind_turns = 0
+        self.p_shield_pct  = 0        # shield wall damage reduction %
+        self.p_shield_turns= 0
 
     def reset_for_battle(self, enemy_key, hard=False):
         e = ENEMIES[enemy_key]
@@ -261,6 +308,16 @@ class GameSession:
         self.phase     = "battle"
         self.pinned_player = None
         self.pinned_enemy  = None
+        self.lb_meter      = 0
+        self.lb_ready      = False
+        self.lb_used       = False
+        self.lb_active     = False
+        self.lb_turns      = 0
+        self.lb_boost_next = False
+        self.e_blinded     = False
+        self.e_blind_turns = 0
+        self.p_shield_pct  = 0
+        self.p_shield_turns= 0
 
     async def refresh_pins(self, p_title="", e_title=""):
         if self.pinned_player:
@@ -378,15 +435,36 @@ async def run_enemy_turn(channel, s: GameSession):
     faces  = ["⚀","⚁","⚂","⚃","⚄","⚅"]
     lines  = [f"👹 **{e['name']}** rolls {faces[e_roll-1]} (**{e_roll}pt**)"]
 
+    # Blind check — enemy miss rate raised by 40% if blinded
+    blind_extra = 0.40 if s.e_blinded else 0.0
+
+    def enemy_atk(raw_dmg, halved):
+        """Roll hit considering blind + hard mode crit/miss."""
+        roll = random.random()
+        if roll < (MISS_CHANCE + blind_extra):
+            return 0, "miss"
+        if s.hard_mode and roll >= (1 - CRIT_CHANCE):
+            d = raw_dmg * 2
+            return (d // 2 if halved else d), "crit"
+        return (raw_dmg // 2 if halved else raw_dmg), "normal"
+
+    def apply_shield(dmg):
+        """Reduce damage by shield wall percentage if active."""
+        if s.p_shield_turns > 0 and dmg > 0:
+            dmg = max(1, int(dmg * (1 - s.p_shield_pct / 100)))
+        return dmg
+
     if s.e_hp / s.e_hp_max < 0.3:
         sig = e["sig"]
-        sig_range = e["hard"]["sig_dmg"] if s.hard_mode else sig["dmg"]
-        raw = random.randint(*sig_range)
-        if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
-        else:
-            dmg = raw // 2 if s.p_defend else raw
-            outcome = "normal"
-        if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+        # Sig damage reduced by 15% from original
+        base_range = e["hard"]["sig_dmg"] if s.hard_mode else sig["dmg"]
+        raw = int(random.randint(*base_range) * 0.85)
+        dmg, outcome = enemy_atk(raw, s.p_defend)
+        dmg = apply_shield(dmg)
+        if dmg > 0:
+            s.p_hp = max(0, s.p_hp - dmg)
+            s.lb_meter = min(LB_MAX, s.lb_meter + dmg)
+            if s.lb_meter >= LB_MAX: s.lb_ready = True
         halved_tag = " *(halved)*" if s.p_defend and dmg > 0 else ""
         if outcome == "miss":   lines.append(f"💨 **{e['name']}** uses **{sig['name']}** — MISSED!")
         elif outcome == "crit": lines.append(f"💥 **CRITICAL!** **{e['name']}** uses **{sig['name']}** for **{dmg}** damage!{halved_tag}")
@@ -396,22 +474,21 @@ async def run_enemy_turn(channel, s: GameSession):
     actions = []; att = 0
     while e_pts > 0 and att < 20:
         att += 1
-        affordable = [(k, m) for k, m in MOVES.items() if m["cost"] <= e_pts]
+        affordable = [(k, m) for k, m in ENEMY_MOVES.items() if m["cost"] <= e_pts]
         if not affordable: break
         mk, m = random.choice(affordable)
         if m["type"] == "atk":
-            slash_r = e["hard"]["slash_dmg"] if (s.hard_mode and mk == "slash") else (e["slash_dmg"] if mk == "slash" else m["dmg"])
-            raw = random.randint(*slash_r)
-            if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
-            else:
-                dmg = raw // 2 if s.p_defend else raw
-                outcome = "normal"
-            if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+            slash_r = e["hard"]["slash_dmg"] if (s.hard_mode and mk == "slash") else e["slash_dmg"]
+            atk_dmg_range = m.get("dmg", slash_r) if mk != "slash" else slash_r
+            raw = int(random.randint(*atk_dmg_range) * 0.85)  # 15% reduction
+            dmg, outcome = enemy_atk(raw, s.p_defend)
+            dmg = apply_shield(dmg)
+            if dmg > 0:
+                s.p_hp = max(0, s.p_hp - dmg)
+                s.lb_meter = min(LB_MAX, s.lb_meter + dmg)
+                if s.lb_meter >= LB_MAX: s.lb_ready = True
             tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
             actions.append(f"**{mk.capitalize()}**{tag} ({dmg} dmg)")
-        elif m["type"] == "heal":
-            h = random.randint(*m["heal"]); s.e_hp = min(s.e_hp_max, s.e_hp + h)
-            actions.append(f"**Cure** (+{h} HP)")
         elif m["type"] == "status":
             if m["effect"] == "poison" and s.p_poison == 0:
                 s.p_poison = 3; actions.append("**Poison**")
@@ -419,12 +496,13 @@ async def run_enemy_turn(channel, s: GameSession):
                 s.e_regen = 3; actions.append("**Regen**")
             else:
                 slash_r = e["hard"]["slash_dmg"] if s.hard_mode else e["slash_dmg"]
-                raw = random.randint(*slash_r)
-                if s.hard_mode: dmg, outcome = calc_hit(raw, halved=s.p_defend)
-                else:
-                    dmg = raw // 2 if s.p_defend else raw
-                    outcome = "normal"
-                if dmg > 0: s.p_hp = max(0, s.p_hp - dmg)
+                raw = int(random.randint(*slash_r) * 0.85)
+                dmg, outcome = enemy_atk(raw, s.p_defend)
+                dmg = apply_shield(dmg)
+                if dmg > 0:
+                    s.p_hp = max(0, s.p_hp - dmg)
+                    s.lb_meter = min(LB_MAX, s.lb_meter + dmg)
+                    if s.lb_meter >= LB_MAX: s.lb_ready = True
                 tag = " 💥CRIT" if outcome == "crit" else (" 💨MISS" if outcome == "miss" else "")
                 actions.append(f"**Slash**{tag} ({dmg} dmg)")
         e_pts -= m["cost"]
@@ -437,7 +515,21 @@ async def run_enemy_turn(channel, s: GameSession):
     if s.e_regen > 0:
         h = random.randint(5, 10); s.e_hp = min(s.e_hp_max, s.e_hp + h); s.e_regen -= 1
         lines.append(f"♻ {e['name']} regenerates **{h}** HP!")
-
+    # Tick blind on enemy
+    if s.e_blinded:
+        s.e_blind_turns -= 1
+        if s.e_blind_turns <= 0:
+            s.e_blinded = False; lines.append("👁 The enemy's blind has worn off!")
+    # Tick shield wall on player
+    if s.p_shield_turns > 0:
+        s.p_shield_turns -= 1
+        if s.p_shield_turns == 0:
+            s.p_shield_pct = 0; lines.append("🛡 Shield Wall has expired!")
+    # Tick generic LB boost
+    if s.lb_active and s.lb_turns > 0:
+        s.lb_turns -= 1
+        if s.lb_turns == 0:
+            s.lb_active = False; lines.append("⚡ Limit Break effect has worn off!")
     s.p_defend = False
     await channel.send("\n".join(lines))
     await s.refresh_pins()
@@ -624,7 +716,7 @@ class RollView(discord.ui.View):
 
 
 class MoveView(discord.ui.View):
-    MOVE_DEFS = [
+    BASE_MOVE_DEFS = [
         ("⚔ Slash  (1pt)",    "slash",   discord.ButtonStyle.secondary, 1),
         ("☠ Poison  (3pt)",   "poison",  discord.ButtonStyle.secondary, 3),
         ("♻ Regen  (3pt)",    "regen",   discord.ButtonStyle.success,   3),
@@ -633,22 +725,32 @@ class MoveView(discord.ui.View):
         ("❄ Ice  (5pt)",      "ice",     discord.ButtonStyle.danger,    5),
         ("⚡ Thunder  (5pt)",  "thunder", discord.ButtonStyle.danger,    5),
     ]
+    WARRIOR_EXTRA = ("🪓 Axe Swing  (3pt)", "axeswing", discord.ButtonStyle.secondary, 3)
 
     def __init__(self, session: GameSession):
         super().__init__(timeout=300)
         self.session = session
         self._rebuild()
 
+    def _get_move_defs(self):
+        s = self.session
+        class_key = next((k for k, v in CLASSES.items() if v is s.chosen_class), "")
+        defs = list(self.BASE_MOVE_DEFS)
+        if class_key == "warrior":
+            defs.insert(1, self.WARRIOR_EXTRA)
+        return defs
+
     def _rebuild(self):
         self.clear_items()
         s = self.session
-        # Row 0 + 1: move buttons (max 5 per row)
-        for i, (label, key, style, cost) in enumerate(self.MOVE_DEFS):
+        move_defs = self._get_move_defs()
+        # Row 0 + 1: move buttons (max 5 per row, up to 8 moves)
+        for i, (label, key, style, cost) in enumerate(move_defs):
             row = 0 if i < 4 else 1
             btn = discord.ui.Button(label=label, style=style, disabled=s.pts_left < cost, custom_id=f"mv_{key}", row=row)
             btn.callback = self._make_move_cb(key, cost)
             self.add_item(btn)
-        # Row 2: Execute | Status | Roll Again
+        # Row 2: Execute | Defend | Status
         exec_btn = discord.ui.Button(
             label=f"✅ Execute ({len(s.queue)} queued)" if s.queue else "✅ Execute",
             style=discord.ButtonStyle.primary,
@@ -677,6 +779,20 @@ class MoveView(discord.ui.View):
         status_btn.callback = self._status_cb
         self.add_item(status_btn)
 
+        # Row 3: Limit Break (only when ready and not used)
+        if s.lb_ready and not s.lb_used:
+            class_key = next((k for k, v in CLASSES.items() if v is s.chosen_class), "")
+            lb_def = LIMIT_BREAKS.get(class_key, LIMIT_BREAKS["default"])
+            lb_btn = discord.ui.Button(
+                label=f"⚡ LIMIT BREAK — {lb_def['name']}  (3pt)",
+                style=discord.ButtonStyle.danger,
+                disabled=s.pts_left < 3,
+                custom_id="mv_lb",
+                row=3
+            )
+            lb_btn.callback = self._lb_cb
+            self.add_item(lb_btn)
+
     def _make_move_cb(self, key, cost):
         async def cb(interaction: discord.Interaction):
             s = self.session
@@ -693,6 +809,45 @@ class MoveView(discord.ui.View):
                 view=self
             )
         return cb
+
+    async def _lb_cb(self, interaction: discord.Interaction):
+        s = self.session
+        if interaction.user.id != s.player.id:
+            await interaction.response.send_message("This is not your battle!", ephemeral=True); return
+        if s.pts_left < 3:
+            await interaction.response.send_message("Not enough points! (costs 3pt)", ephemeral=True); return
+        if not s.lb_ready or s.lb_used:
+            await interaction.response.send_message("Limit Break not available!", ephemeral=True); return
+        s.pts_left -= 3
+        s.lb_ready  = False
+        s.lb_used   = True
+        s.lb_meter  = 0
+        class_key   = next((k for k, v in CLASSES.items() if v is s.chosen_class), "")
+        lb_def      = LIMIT_BREAKS.get(class_key, LIMIT_BREAKS["default"])
+        self.stop()
+        # Apply the limit break effect
+        if lb_def["type"] == "defense":          # Warrior — Shield Wall
+            s.lb_active      = True
+            s.lb_turns       = 5
+            s.p_shield_pct   = 25
+            s.p_shield_turns = 5
+            msg = f"⚡ **LIMIT BREAK — {lb_def['name']}!**\n🛡 Incoming damage reduced by **25%** for **5 turns**!"
+        elif lb_def["type"] == "blind":          # Red Mage — Vermilion Scourge
+            s.lb_active      = True
+            s.lb_turns       = 5
+            s.e_blinded      = True
+            s.e_blind_turns  = 5
+            msg = f"⚡ **LIMIT BREAK — {lb_def['name']}!**\n👁 {s.enemy['name']} is **blinded**! Miss rate +40% for **5 turns**!"
+        else:                                    # Generic — atk_boost
+            s.lb_boost_next  = True
+            msg = f"⚡ **LIMIT BREAK — {lb_def['name']}!**\n💥 Next attack deals **3× damage**!"
+        await interaction.response.edit_message(content=msg, view=None)
+        await s.refresh_pins()
+        # Continue with remaining points
+        if s.pts_left > 0:
+            await interaction.channel.send(f"**{s.pts_left}pt** remaining — pick more moves:", view=MoveView(s))
+        else:
+            await run_enemy_turn(interaction.channel, s)
 
     async def _defend_cb(self, interaction: discord.Interaction):
         s = self.session
@@ -735,8 +890,13 @@ class MoveView(discord.ui.View):
             if m["type"] == "atk":
                 raw = random.randint(*m["dmg"])
                 dmg, outcome = calc_hit(raw) if s.hard_mode else (raw, "normal")
+                # Apply lb_boost_next (generic — 3× damage)
+                if s.lb_boost_next and dmg > 0:
+                    dmg *= 3; s.lb_boost_next = False
+                    lines.append(f"💥 **LIMIT BREAK BOOST!**")
                 if dmg > 0: s.e_hp = max(0, s.e_hp - dmg)
-                lines.append(hit_line(mk.capitalize(), s.char_name, s.enemy["name"], outcome, dmg))
+                lines.append(hit_line(mk.capitalize() if mk != "axeswing" else "Axe Swing",
+                                      s.char_name, s.enemy["name"], outcome, dmg))
             elif m["type"] == "heal":
                 h = random.randint(*m["heal"]); s.p_hp = min(s.p_hp_max, s.p_hp + h)
                 lines.append(f"💚 **Cure** restores **{h}** HP!")
