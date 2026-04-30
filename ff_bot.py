@@ -73,6 +73,14 @@ async def init_db():
             await c.execute("ALTER TABLE save_slots ADD PRIMARY KEY (user_id, slot, game)")
         except Exception:
             pass
+    async with db_pool.acquire() as c:
+        await c.execute("""CREATE TABLE IF NOT EXISTS iwf_leaderboard(
+            user_id BIGINT NOT NULL,
+            char_name TEXT NOT NULL DEFAULT 'Unknown',
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id)
+        )""")
     print("Database ready.")
 
 async def db_ensure(uid):
@@ -120,6 +128,23 @@ async def db_del_save(uid,slot,game="ff"):
     if not db_pool: return
     async with db_pool.acquire() as c:
         await c.execute("DELETE FROM save_slots WHERE user_id=$1 AND slot=$2 AND game=$3",uid,slot,game)
+
+async def iwf_add_win(uid,char_name="Unknown"):
+    if not db_pool: return
+    async with db_pool.acquire() as c:
+        await c.execute("""INSERT INTO iwf_leaderboard(user_id,char_name,wins) VALUES($1,$2,1)
+            ON CONFLICT(user_id) DO UPDATE SET wins=iwf_leaderboard.wins+1,char_name=$2""",uid,char_name)
+
+async def iwf_add_loss(uid,char_name="Unknown"):
+    if not db_pool: return
+    async with db_pool.acquire() as c:
+        await c.execute("""INSERT INTO iwf_leaderboard(user_id,char_name,losses) VALUES($1,$2,0)
+            ON CONFLICT(user_id) DO UPDATE SET losses=iwf_leaderboard.losses+1,char_name=$2""",uid,char_name)
+
+async def iwf_get_board():
+    if not db_pool: return []
+    async with db_pool.acquire() as c:
+        return await c.fetch("SELECT user_id,char_name,wins,losses FROM iwf_leaderboard ORDER BY wins DESC,losses ASC LIMIT 10")
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 def hp_bar(cur,mx,n=16): f=round((cur/mx)*n); return "█"*f+"░"*(n-f)
@@ -1043,11 +1068,14 @@ async def iwf_end_pve(ch,s,sk,iwf_sessions):
 
 async def iwf_end_duel(d,iwf_duels):
     d.active=False
-    if d.c_hp<=0: title=f"{d.o_name} Wins!"; color=0x50e090; w=d.opponent; l=d.challenger
-    else: title=f"{d.c_name} Wins!"; color=0x50e090; w=d.challenger; l=d.opponent
+    if d.c_hp<=0: title=f"{d.o_name} Wins!"; color=0x50e090; w=d.opponent; l=d.challenger; wn=d.o_name; ln=d.c_name
+    else: title=f"{d.c_name} Wins!"; color=0x50e090; w=d.challenger; l=d.opponent; wn=d.c_name; ln=d.o_name
     await d.refresh(title)
-    em=discord.Embed(title=title,description=random.choice(IWF_WIN) if w else "No winner!",color=color)
-    if w and l: em.add_field(name="Result",value=f"{w.mention} defeats {l.mention}!",inline=False)
+    # Track wins/losses
+    await iwf_add_win(w.id, wn)
+    await iwf_add_loss(l.id, ln)
+    em=discord.Embed(title=title,description=random.choice(IWF_WIN),color=color)
+    em.add_field(name="Result",value=f"{w.mention} defeats {l.mention}!",inline=False)
     await d.channel.send(embed=em)
     try: await d.channel.set_permissions(d.opponent,overwrite=None)
     except: pass
@@ -1158,6 +1186,84 @@ class IWFEnemyView(discord.ui.View):
             s.battle_msgs.append(pick_msg)
         return cb
 
+class IWFSlotSelect2View(discord.ui.View):
+    """2-slot picker shown on first !FFQ or via !FFQSLOT."""
+    def __init__(self,uid,saves,ch,iwf_sessions,iwf_saves,db_save):
+        super().__init__(timeout=120)
+        self.uid=uid; self.saves=saves; self.ch=ch
+        self.iwf_sessions=iwf_sessions; self.iwf_saves=iwf_saves; self.db_save=db_save
+        for slot in(1,2):
+            row=saves.get(slot)
+            if row:
+                cls=IWF_CLASSES.get(row.get("class_key",""),{})
+                label=f"▶ Slot {slot} — {row.get('char_name',cls.get('name','?'))} ({cls.get('name','?')})"
+                style=discord.ButtonStyle.primary
+            else:
+                label=f"✦ Slot {slot} — New Character"
+                style=discord.ButtonStyle.secondary
+            b=discord.ui.Button(label=label,style=style,custom_id=f"iwf2s_{slot}")
+            b.callback=self._cb(slot,row)
+            self.add_item(b)
+
+    def _cb(self,slot,row):
+        async def cb(i):
+            if i.user.id!=self.uid: await i.response.send_message("Not your game!",ephemeral=True); return
+            await i.response.defer(); self.stop()
+            key=(self.uid,slot)
+            # Delete slot picker message
+            try: await i.message.delete()
+            except: pass
+            if row:
+                # Load existing character straight to enemy select
+                cls=IWF_CLASSES.get(row.get("class_key",""))
+                if cls:
+                    self.iwf_sessions[key]={"class_key":row["class_key"],"char_name":row.get("char_name",cls["name"]),"class":cls}
+                em=discord.Embed(title="👹 Choose Your Opponent",color=0x2a55c0)
+                for k,e in IWF_ENEMIES.items(): em.add_field(name=e["name"],value=e["desc"],inline=False)
+                ev=IWFEnemyView(key,self.iwf_sessions,self.ch)
+                ev.msg=await self.ch.send(embed=em,view=ev)
+            else:
+                # New slot — class select
+                self.iwf_sessions[key]=None
+                em=discord.Embed(title=f"🧊🌪🔥 Slot {slot} — Choose Your Class",color=0x1a3a8a)
+                for k,cls in IWF_CLASSES.items():
+                    em.add_field(name=cls["name"],value=cls["role"],inline=True)
+                await self.ch.send(embed=em,view=IWFClassView(self.uid,slot,self.ch,self.iwf_sessions,self.iwf_saves,self.db_save))
+        return cb
+
+
+class IWFNameView(discord.ui.View):
+    """Shown after class pick — rename character or keep default."""
+    def __init__(self,uid,slot,default_name,cls,ch,iwf_sessions,iwf_saves,db_save):
+        super().__init__(timeout=120)
+        self.uid=uid; self.slot=slot; self.default_name=default_name; self.cls=cls
+        self.ch=ch; self.iwf_sessions=iwf_sessions; self.iwf_saves=iwf_saves; self.db_save=db_save
+
+    @discord.ui.button(label="✏️ Change Name",style=discord.ButtonStyle.primary)
+    async def rename(self,i,b):
+        if i.user.id!=self.uid: await i.response.send_message("Not your game!",ephemeral=True); return
+        await i.response.send_message("Type your character name (max 12 chars): `!ffqname YourName`",ephemeral=True)
+
+    @discord.ui.button(label="✅ Keep Name & Continue",style=discord.ButtonStyle.success)
+    async def keep(self,i,b):
+        if i.user.id!=self.uid: await i.response.send_message("Not your game!",ephemeral=True); return
+        await i.response.defer(); self.stop()
+        try: await i.message.delete()
+        except: pass
+        await self._launch(self.default_name, i.channel)
+
+    async def _launch(self,char_name,ch):
+        key=(self.uid,self.slot)
+        self.iwf_saves[key]={"class_key":next((k for k,c in IWF_CLASSES.items() if c is self.cls),""),"char_name":char_name,"class":self.cls}
+        self.iwf_sessions[key]=self.iwf_saves[key]
+        try: await self.db_save(self.uid,self.slot,self.iwf_saves[key]["class_key"],char_name,game="iwf")
+        except Exception as e: print(f"IWF save error: {e}")
+        em=discord.Embed(title="👹 Choose Your Opponent",color=0x2a55c0)
+        for k,e in IWF_ENEMIES.items(): em.add_field(name=e["name"],value=e["desc"],inline=False)
+        ev=IWFEnemyView(key,self.iwf_sessions,ch)
+        ev.msg=await ch.send(embed=em,view=ev)
+
+
 class IWFClassView(discord.ui.View):
     def __init__(self,uid,slot,ch,iwf_sessions,iwf_saves,db_save=None):
         super().__init__(timeout=120); self.uid=uid; self.slot=slot; self.ch=ch; self.iwf_sessions=iwf_sessions; self.iwf_saves=iwf_saves; self._db_save=db_save
@@ -1169,14 +1275,14 @@ class IWFClassView(discord.ui.View):
             await i.response.defer(); self.stop()
             em=discord.Embed(title=f"Class: {cls['name']}",color=0x2a55c0); em.set_image(url=ASSET_BASE_URL+cls["gif"])
             await i.followup.send(embed=em)
-            char_name=cls["name"]  # use class name as default
-            self.iwf_saves[(self.uid,self.slot)]={"class_key":key,"char_name":char_name,"class":cls}
-            self.iwf_sessions[(self.uid,self.slot)]=self.iwf_saves[(self.uid,self.slot)]
-            try: await db_save_char(self.uid,self.slot,key,char_name,game="iwf")
-            except Exception as e: print(f"IWF save error (non-fatal): {e}")
-            em2=discord.Embed(title="Choose Your Opponent",color=0x2a55c0)
-            for k,e_ in IWF_ENEMIES.items(): em2.add_field(name=e_["name"],value=e_["desc"],inline=False)
-            await self.ch.send(embed=em2,view=IWFEnemyView((self.uid,self.slot),self.iwf_sessions,self.ch))
+            # Show name prompt — let player rename or keep class name as default
+            try: await i.message.delete()
+            except: pass
+            em2=discord.Embed(title=f"🧊🌪🔥 {cls['name']} selected!",
+                description=f"Your character will be named **{cls['name']}** by default.\nWould you like to change it?",
+                color=0x2a55c0)
+            em2.set_image(url=ASSET_BASE_URL+cls["gif"])
+            await self.ch.send(embed=em2,view=IWFNameView(self.uid,self.slot,cls["name"],cls,self.ch,self.iwf_sessions,self.iwf_saves,self._db_save if hasattr(self,"_db_save") else db_save_char))
         return cb
 
 class IWFSlotView(discord.ui.View):
@@ -1215,35 +1321,52 @@ class IceWindFire(commands.Cog):
         if opponent: await self._duel(ctx,opponent); return
         uid=ctx.author.id
         # Check if player already has an active IWF session this message
-        existing=next(((u,s) for(u,s),v in self.iwf_sessions.items() if u==uid and isinstance(v,IWFSession)),None)
+        # Check if player has an active session already
+        existing=next(((u,sl) for(u,sl),v in self.iwf_sessions.items()
+                        if u==uid and v is not None and (
+                            isinstance(v,IWFSession) or
+                            (isinstance(v,dict) and v.get("char_name"))
+                        )),None)
         if existing:
-            # Already has a character — go straight to enemy select
-            key=existing; s=self.iwf_sessions[key]
+            # Already playing — go straight to enemy select with current slot
+            key=existing
             em=discord.Embed(title="👹 Choose Your Opponent",color=0x2a55c0)
             for k,e in IWF_ENEMIES.items(): em.add_field(name=e["name"],value=e["desc"],inline=False)
             ev=IWFEnemyView(key,self.iwf_sessions,ctx.channel)
             ev.msg=await ctx.send(embed=em,view=ev)
             return
-        # New player — go straight to class select (slot 1 used internally, no UI)
-        key=(uid,1); self.iwf_sessions[key]=None
-        em=discord.Embed(title="🧊🌪🔥 Ice Wind & Fire — Choose Your Class",color=0x1a3a8a)
-        for k,cls in IWF_CLASSES.items():
-            em.add_field(name=cls["name"],value=cls["role"],inline=True)
-        await ctx.send(embed=em,view=IWFClassView(uid,1,ctx.channel,self.iwf_sessions,self.iwf_saves,self._db_save))
+        # Show 2-slot picker
+        saves={1:None,2:None}
+        for sl in(1,2):
+            v=self.iwf_sessions.get((uid,sl))
+            if isinstance(v,dict) and v.get("char_name"): saves[sl]=v
+            elif isinstance(v,IWFSession): saves[sl]={"class_key":next((k for k,c in IWF_CLASSES.items() if c is v.char_class),""),"char_name":v.char_name}
+        em=discord.Embed(title="🧊🌪🔥 Ice Wind & Fire — Choose a Slot",description="Pick a slot to play or start a new character.",color=0x1a3a8a)
+        for sl in(1,2):
+            row=saves[sl]
+            if row: cls=IWF_CLASSES.get(row.get("class_key",""),{}); em.add_field(name=f"Slot {sl} — {row.get('char_name',cls.get('name','?'))}",value=f"Class: {cls.get('name','?')}",inline=True)
+            else: em.add_field(name=f"Slot {sl} — Empty",value="New character",inline=True)
+        await ctx.send(embed=em,view=IWFSlotSelect2View(uid,saves,ctx.channel,self.iwf_sessions,self.iwf_saves,self._db_save))
 
     @commands.command(name="ffqname")
     async def set_name(self,ctx,*,char_name:str):
         uid=ctx.author.id
+        # Find a pending name view (saves with empty char_name)
         key=next(((u,s) for(u,s),v in self.iwf_saves.items() if u==uid and isinstance(v,dict) and v.get("char_name")==""),None)
-        if not key: await ctx.send("No pending character — type !FFQ to start."); return
+        if not key: await ctx.send("No pending character — type `!FFQ` to start."); return
         if len(char_name)>12: await ctx.send("Max 12 characters."); return
         save=self.iwf_saves[key]; save["char_name"]=char_name
-        await self._db_save(uid,key[1],save["class_key"],char_name,game="iwf")
-        cls=save["class"]; em=discord.Embed(title=f"{char_name} enters the arena!",color=0xf0d060); em.set_image(url=ASSET_BASE_URL+cls["gif"]); em.add_field(name="Class",value=cls["name"],inline=True)
-        self.iwf_sessions[key]=save; await ctx.send(embed=em)
-        em2=discord.Embed(title="Choose Opponent",color=0x2a55c0)
+        cls=save["class"]
+        try: await self._db_save(uid,key[1],save["class_key"],char_name,game="iwf")
+        except Exception as e: print(f"IWF save error: {e}")
+        self.iwf_sessions[key]=save
+        em=discord.Embed(title=f"✨ {char_name} enters the arena!",color=0xf0d060)
+        em.set_image(url=ASSET_BASE_URL+cls["gif"]); em.add_field(name="Class",value=cls["name"],inline=True)
+        await ctx.send(embed=em)
+        em2=discord.Embed(title="👹 Choose Your Opponent",color=0x2a55c0)
         for k,e in IWF_ENEMIES.items(): em2.add_field(name=e["name"],value=e["desc"],inline=False)
-        await ctx.send(embed=em2,view=IWFEnemyView(key,self.iwf_sessions,ctx.channel))
+        ev=IWFEnemyView(key,self.iwf_sessions,ctx.channel)
+        ev.msg=await ctx.send(embed=em2,view=ev)
 
     async def _duel(self,ctx,opponent):
         if ctx.author.id==opponent.id: await ctx.send("Can't duel yourself!"); return
@@ -1276,6 +1399,59 @@ class IceWindFire(commands.Cog):
         d.pinned_c=cm; d.pinned_o=om
         first_msg=await ch.send(f"Round 1 — Both pick!\n{data['challenger'].mention} and {ctx.author.mention}",view=IWFDuelPickView(d,self.iwf_duels))
         await ctx.send(f"IWF duel accepted! Head to {ch.mention}!")
+
+    @commands.command(name="FFQRESET")
+    async def iwf_reset(self,ctx):
+        """Reset IWF progress for current slot."""
+        uid=ctx.author.id
+        # Find active slot
+        active=next(((u,sl) for(u,sl),v in self.iwf_sessions.items() if u==uid and v is not None),None)
+        if not active:
+            await ctx.send("You don't have an active IWF character! Type `!FFQ` to start."); return
+        slot=active[1]
+        # Wipe session and DB save for this slot
+        self.iwf_sessions.pop(active,None)
+        self.iwf_saves.pop(active,None)
+        try: await db_del_save(uid,slot,game="iwf")
+        except: pass
+        em=discord.Embed(title="🔄 IWF Reset",
+            description=f"Slot {slot} has been cleared!\nType `!FFQ` to start a new character.",
+            color=0x2a55c0)
+        await ctx.send(embed=em)
+
+    @commands.command(name="FFQBOARD")
+    async def iwf_board(self,ctx):
+        """Show IWF PvP leaderboard."""
+        rows=await iwf_get_board()
+        em=discord.Embed(title="🧊🌪🔥 Ice Wind & Fire — PvP Leaderboard",color=0x1a3a8a)
+        if not rows:
+            em.description="No PvP battles recorded yet! Challenge someone with `!FFQ @user`."
+        else:
+            medals=["🥇","🥈","🥉"] + ["🔹"]*(10)
+            board_lines=[]
+            for idx,r in enumerate(rows):
+                total=r["wins"]+r["losses"]
+                winrate=f"{round(r['wins']/total*100)}%" if total>0 else "—"
+                board_lines.append(f"{medals[idx]} **{r['char_name']}** — {r['wins']}W / {r['losses']}L ({winrate})")
+            em.description="\n".join(board_lines)
+        em.set_footer(text="Ranked by wins. PvP duels only.")
+        await ctx.send(embed=em)
+
+    @commands.command(name="FFQSLOT")
+    async def iwf_slot(self,ctx):
+        """Switch IWF slot at any time."""
+        uid=ctx.author.id
+        saves={1:None,2:None}
+        for sl in(1,2):
+            v=self.iwf_sessions.get((uid,sl))
+            if isinstance(v,dict) and v.get("char_name"): saves[sl]=v
+            elif isinstance(v,IWFSession): saves[sl]={"class_key":next((k for k,c in IWF_CLASSES.items() if c is v.char_class),""),"char_name":v.char_name}
+        em=discord.Embed(title="🧊🌪🔥 Switch IWF Slot",description="Pick a slot to switch to.",color=0x1a3a8a)
+        for sl in(1,2):
+            row=saves[sl]
+            if row: cls=IWF_CLASSES.get(row.get("class_key",""),{}); em.add_field(name=f"Slot {sl} — {row.get('char_name',cls.get('name','?'))}",value=f"Class: {cls.get('name','?')}",inline=True)
+            else: em.add_field(name=f"Slot {sl} — Empty",value="New character",inline=True)
+        await ctx.send(embed=em,view=IWFSlotSelect2View(uid,saves,ctx.channel,self.iwf_sessions,self.iwf_saves,self._db_save))
 
     @commands.command(name="ffqdecline")
     async def decline(self,ctx,challenger:discord.Member):
