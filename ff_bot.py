@@ -64,6 +64,9 @@ async def init_db():
     async with db_pool.acquire() as c:
         await c.execute("""CREATE TABLE IF NOT EXISTS players(user_id BIGINT PRIMARY KEY,gil INTEGER NOT NULL DEFAULT 200,hard_unlocked TEXT NOT NULL DEFAULT '')""")
         await c.execute("""CREATE TABLE IF NOT EXISTS save_slots(user_id BIGINT NOT NULL,slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 3),class_key TEXT,char_name TEXT,zodiac TEXT,game TEXT NOT NULL DEFAULT 'ff',PRIMARY KEY(user_id,slot,game))""")
+    # Migrate existing table — add game column if missing
+    async with db_pool.acquire() as c:
+        await c.execute("ALTER TABLE save_slots ADD COLUMN IF NOT EXISTS game TEXT NOT NULL DEFAULT 'ff'")
     print("Database ready.")
 
 async def db_ensure(uid):
