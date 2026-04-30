@@ -178,6 +178,19 @@ async def db_unlock_hard(uid: int, enemy_key: str):
             "UPDATE players SET hard_unlocked=$1 WHERE user_id=$2",
             ",".join(unlocked), uid)
 
+def slot_card(slot: int, row: dict | None) -> discord.Embed:
+    """Build a single slot embed with GIF thumbnail."""
+    if row:
+        cls   = CLASSES.get(row["class_key"], {})
+        em    = discord.Embed(title=f"📁 Slot {slot} — {row['char_name']}", color=0x2a55c0)
+        em.set_thumbnail(url=ASSET_BASE_URL + cls.get("gif", ""))
+        em.add_field(name="Class",  value=cls.get("name", "?"), inline=True)
+        em.add_field(name="Zodiac", value=row.get("zodiac") or "—", inline=True)
+    else:
+        em = discord.Embed(title=f"📁 Slot {slot} — Empty", description="Start a new adventure", color=0x2a2a4a)
+    return em
+
+
 async def db_get_saves(uid: int) -> dict:
     """Returns {1: row, 2: row, 3: row} — row is None if slot empty."""
     if not db_pool: return {1: None, 2: None, 3: None}
@@ -1209,8 +1222,9 @@ class ContinueOrNewView(discord.ui.View):
         await interaction.response.defer()
         self.stop()
         saves = await db_get_saves(self.uid)
-        em = discord.Embed(title="📁 Select Save Slot", description="Pick a slot to continue or start fresh.", color=0x2a55c0)
-        await interaction.followup.send(embed=em, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
+        header = discord.Embed(title="📁 Select Save Slot", description="Pick a slot to continue or start fresh.", color=0x2a55c0)
+        slot_embeds = [slot_card(s, saves[s]) for s in (1, 2, 3)]
+        await interaction.followup.send(embeds=[header] + slot_embeds, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
 
 
 class ConfirmOverwriteView(discord.ui.View):
@@ -1238,8 +1252,9 @@ class ConfirmOverwriteView(discord.ui.View):
         await interaction.response.defer()
         self.stop()
         saves = await db_get_saves(self.uid)
-        em = discord.Embed(title="📁 Select Save Slot", color=0x2a55c0)
-        await interaction.followup.send(embed=em, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
+        header = discord.Embed(title="📁 Select Save Slot", color=0x2a55c0)
+        slot_embeds = [slot_card(s, saves[s]) for s in (1, 2, 3)]
+        await interaction.followup.send(embeds=[header] + slot_embeds, view=SaveSlotView(self.uid, saves, interaction.guild, self.channel))
 
 # ─────────────────────────────────────────────
 #  BOT SETUP
@@ -1300,22 +1315,9 @@ async def start_ff(ctx: commands.Context):
         await ctx.send(f"✨ {ctx.author.mention} Your adventure awaits: {game_channel.mention}")
     # Show save slot picker
     saves = await db_get_saves(ctx.author.id)
-    em = discord.Embed(
-        title="📁 Select Save Slot",
-        description="Pick a slot to continue your adventure or start a new character.",
-        color=0x2a55c0
-    )
-    for slot, row in saves.items():
-        if row:
-            cls = CLASSES.get(row["class_key"], {})
-            em.add_field(
-                name=f"Slot {slot} — {row['char_name']}",
-                value=f"Class: {cls.get('name','?')} | `!gil` for balance",
-                inline=False
-            )
-        else:
-            em.add_field(name=f"Slot {slot} — Empty", value="Start a new adventure", inline=False)
-    await game_channel.send(embed=em, view=SaveSlotView(ctx.author.id, saves, guild, game_channel))
+    header = discord.Embed(title="📁 Select Save Slot", description="Pick a slot to continue your adventure or start a new character.", color=0x2a55c0)
+    slot_embeds = [slot_card(s, saves[s]) for s in (1, 2, 3)]
+    await game_channel.send(embeds=[header] + slot_embeds, view=SaveSlotView(ctx.author.id, saves, guild, game_channel))
 
 async def send_class_select(channel, slot: int = 0):
     """Send class selection. slot=0 means no slot context (e.g. ffreset)."""
@@ -1519,25 +1521,14 @@ async def titlescreen(ctx: commands.Context):
         active_sessions[cid].pinned_enemy  = None
     saves = await db_get_saves(ctx.author.id)
     bal   = await db_get_gil(ctx.author.id)
-    em = discord.Embed(
+    header = discord.Embed(
         title="🎮 Title Screen",
-        description=(
-            f"💰 Gil: **{bal}**\n\nYour progress is saved. Pick a slot to continue or switch characters."
-        ),
+        description=f"💰 Gil: **{bal}**\n\nYour progress is saved. Pick a slot to continue or switch characters.",
         color=0x1a3a8a
     )
-    for slot, row in saves.items():
-        if row:
-            cls = CLASSES.get(row["class_key"], {})
-            em.add_field(
-                name=f"📁 Slot {slot} — {row['char_name']}",
-                value=f"Class: {cls.get('name', '?')}",
-                inline=False
-            )
-        else:
-            em.add_field(name=f"📁 Slot {slot} — Empty", value="Start a new adventure", inline=False)
-    em.set_footer(text="Select a slot below to continue")
-    await ctx.send(embed=em, view=TitleScreenView(ctx.author.id, saves, ctx.guild, ctx.channel))
+    header.set_footer(text="Select a slot below to continue")
+    slot_embeds = [slot_card(s, saves[s]) for s in (1, 2, 3)]
+    await ctx.send(embeds=[header] + slot_embeds, view=TitleScreenView(ctx.author.id, saves, ctx.guild, ctx.channel))
 
 
 class TitleScreenView(discord.ui.View):
@@ -1615,18 +1606,9 @@ async def ffslot(ctx: commands.Context):
     if cid in active_sessions:
         del active_sessions[cid]
     saves = await db_get_saves(ctx.author.id)
-    em = discord.Embed(
-        title="📁 Switch Save Slot",
-        description="Pick a slot to load or start a new character.",
-        color=0x2a55c0
-    )
-    for slot, row in saves.items():
-        if row:
-            cls = CLASSES.get(row["class_key"], {})
-            em.add_field(name=f"Slot {slot} — {row['char_name']}", value=f"Class: {cls.get('name','?')}", inline=False)
-        else:
-            em.add_field(name=f"Slot {slot} — Empty", value="Start a new adventure", inline=False)
-    await ctx.send(embed=em, view=SaveSlotView(ctx.author.id, saves, ctx.guild, ctx.channel))
+    header = discord.Embed(title="📁 Switch Save Slot", description="Pick a slot to load or start a new character.", color=0x2a55c0)
+    slot_embeds = [slot_card(s, saves[s]) for s in (1, 2, 3)]
+    await ctx.send(embeds=[header] + slot_embeds, view=SaveSlotView(ctx.author.id, saves, ctx.guild, ctx.channel))
 
 
 # ─────────────────────────────────────────────
@@ -1656,8 +1638,9 @@ async def ffreset(ctx: commands.Context):
     await ctx.send(embed=em)
     # Show slot picker again
     saves = await db_get_saves(ctx.author.id)
-    em2 = discord.Embed(title="📁 Select Save Slot", description="Pick a slot to continue or start fresh.", color=0x2a55c0)
-    await ctx.send(embed=em2, view=SaveSlotView(ctx.author.id, saves, ctx.guild, ctx.channel))
+    header2 = discord.Embed(title="📁 Select Save Slot", description="Pick a slot to continue or start fresh.", color=0x2a55c0)
+    slot_embeds2 = [slot_card(s, saves[s]) for s in (1, 2, 3)]
+    await ctx.send(embeds=[header2] + slot_embeds2, view=SaveSlotView(ctx.author.id, saves, ctx.guild, ctx.channel))
 
 # ─────────────────────────────────────────────
 #  !endgame
