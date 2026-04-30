@@ -936,7 +936,7 @@ def _is_gc(ctx): return ctx.channel.id in active_sessions or ctx.channel.id in p
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ICE WIND & FIRE MINI-GAME
 # ═══════════════════════════════════════════════════════════════════════════════
-IWF_MAX_HP=10; IWF_ROUNDS=10
+IWF_MAX_HP=50; IWF_ROUNDS=999  # no round limit — play until someone hits 0
 ELEMENTS={"ice":{"label":"🧊 Ice","emoji":"🧊","beats":"wind"},"wind":{"label":"🌪 Wind","emoji":"🌪","beats":"fire"},"fire":{"label":"🔥 Fire","emoji":"🔥","beats":"ice"}}
 IWF_CLASSES={"crystalwarrior":{"name":"Crystal Warrior","role":"Fighter","gif":"Warrior.gif"},"stormcaller":{"name":"Storm Caller","role":"Mage","gif":"Redmage.gif"},"emberblade":{"name":"Ember Blade","role":"Duelist","gif":"Archer.gif"}}
 IWF_ENEMIES={"sephiroth":{"name":"Sephiroth","gif":"unit_335000305_1idle_opac.gif","element":"wind","desc":"The One-Winged Angel."},"cod":{"name":"Cloud of Darkness","gif":"unit_203000803_1idle_opac.gif","element":"ice","desc":"An entity of void."},"garland":{"name":"Garland","gif":"unit_201000203_1idle_opac.gif","element":"fire","desc":"The knight of chaos."}}
@@ -950,33 +950,58 @@ def iwf_resolve(a,b):
 
 def iwf_hp_bar(cur,n=10): f=round((cur/IWF_MAX_HP)*n); return "█"*f+"░"*(n-f)
 
-def iwf_battle_em(pn,pc,pg,php,en,ec,eg,ehp,rnd,title="Ice Wind & Fire",footer=""):
-    em=discord.Embed(title=title,color=0x1a3a8a)
-    em.set_thumbnail(url=ASSET_BASE_URL+pg); em.set_image(url=ASSET_BASE_URL+eg)
-    em.add_field(name=f"⚔ {pn} [{pc}]",value=f"`{iwf_hp_bar(php)}` **{php}/{IWF_MAX_HP}**",inline=True)
-    em.add_field(name=f"👹 {en} [{ec}]",value=f"`{iwf_hp_bar(ehp)}` **{ehp}/{IWF_MAX_HP}**",inline=True)
-    em.add_field(name="Round",value=f"**{rnd}**/{IWF_ROUNDS}",inline=False)
-    if footer: em.set_footer(text=footer)
-    return em
+def iwf_battle_ems(pn,pc,pg,php,en,ec,eg,ehp,rnd,title="Ice Wind & Fire",footer=""):
+    """Returns (player_em, enemy_em) — two embeds sent together so GIFs face each other."""
+    p_em=discord.Embed(title=f"⚔ {pn}",color=0x1a3a8a)
+    p_em.set_image(url=ASSET_BASE_URL+pg)
+    p_em.add_field(name="HP",value=f"`{iwf_hp_bar(php)}`\n**{php} / {IWF_MAX_HP}**",inline=False)
+    p_em.add_field(name="Class",value=pc,inline=True)
+    if rnd: p_em.set_footer(text=f"Round {rnd}")
 
-def iwf_duel_em(cn,cg,chp,on,og,ohp,rnd,cp,op,title="IWF Duel"):
-    em=discord.Embed(title=title,color=0x8b0000)
-    em.set_thumbnail(url=ASSET_BASE_URL+cg); em.set_image(url=ASSET_BASE_URL+og)
-    em.add_field(name=cn,value=f"`{iwf_hp_bar(chp)}` **{chp}/{IWF_MAX_HP}**\n{'✅ Picked' if cp else '⏳ Waiting...'}",inline=True)
-    em.add_field(name=on,value=f"`{iwf_hp_bar(ohp)}` **{ohp}/{IWF_MAX_HP}**\n{'✅ Picked' if op else '⏳ Waiting...'}",inline=True)
-    em.add_field(name="Round",value=f"**{rnd}**/{IWF_ROUNDS}",inline=False)
-    em.set_footer(text="Both players pick simultaneously!")
-    return em
+    e_em=discord.Embed(title=f"👹 {en}",color=0x8b0000)
+    e_em.set_image(url=ASSET_BASE_URL+eg)
+    e_em.add_field(name="HP",value=f"`{iwf_hp_bar(ehp)}`\n**{ehp} / {IWF_MAX_HP}**",inline=False)
+    e_em.add_field(name="Type",value=ec,inline=True)
+    if footer: e_em.set_footer(text=footer)
+    return p_em, e_em
+
+def iwf_duel_ems(cn,cg,chp,on,og,ohp,rnd,cp,op,title="IWF Duel"):
+    """Returns (challenger_em, opponent_em) — two embeds facing each other."""
+    c_em=discord.Embed(title=f"⚔ {cn}",color=0x1a3a8a)
+    c_em.set_image(url=ASSET_BASE_URL+cg)
+    c_em.add_field(name="HP",value=f"`{iwf_hp_bar(chp)}`\n**{chp} / {IWF_MAX_HP}**",inline=False)
+    c_em.add_field(name="Status",value="✅ Picked!" if cp else "⏳ Waiting...",inline=True)
+    if rnd: c_em.set_footer(text=f"Round {rnd}")
+
+    o_em=discord.Embed(title=f"⚔ {on}",color=0x8b0000)
+    o_em.set_image(url=ASSET_BASE_URL+og)
+    o_em.add_field(name="HP",value=f"`{iwf_hp_bar(ohp)}`\n**{ohp} / {IWF_MAX_HP}**",inline=False)
+    o_em.add_field(name="Status",value="✅ Picked!" if op else "⏳ Waiting...",inline=True)
+    o_em.set_footer(text="Both players pick simultaneously!")
+    return c_em, o_em
+
+# Keep old single-embed names as wrappers for any refresh calls
+def iwf_battle_em(pn,pc,pg,php,en,ec,eg,ehp,rnd,title="",footer=""):
+    p,e=iwf_battle_ems(pn,pc,pg,php,en,ec,eg,ehp,rnd,title,footer); return p  # legacy
+
+def iwf_duel_em(cn,cg,chp,on,og,ohp,rnd,cp,op,title=""):
+    c,o=iwf_duel_ems(cn,cg,chp,on,og,ohp,rnd,cp,op,title); return c  # legacy
 
 class IWFSession:
     def __init__(self,player,char_name,char_class,enemy_key):
         self.player=player; self.char_name=char_name; self.char_class=char_class
         self.enemy_key=enemy_key; self.enemy=IWF_ENEMIES[enemy_key]
-        self.p_hp=IWF_MAX_HP; self.e_hp=IWF_MAX_HP; self.round=1; self.pinned=None
-        self.battle_msgs=[]   # track all messages sent during battle for cleanup
-    async def refresh(self,title="Ice Wind & Fire"):
-        if self.pinned:
-            try: await self.pinned.edit(embed=iwf_battle_em(self.char_name,self.char_class["name"],self.char_class["gif"],self.p_hp,self.enemy["name"],self.enemy["element"].capitalize(),self.enemy["gif"],self.e_hp,self.round,title=title))
+        self.p_hp=IWF_MAX_HP; self.e_hp=IWF_MAX_HP; self.round=1
+        self.pinned_p=None; self.pinned_e=None   # two pinned cards
+        self.battle_msgs=[]
+    async def refresh(self,title=""):
+        p_em,e_em=iwf_battle_ems(self.char_name,self.char_class["name"],self.char_class["gif"],self.p_hp,self.enemy["name"],self.enemy["element"].capitalize(),self.enemy["gif"],self.e_hp,self.round)
+        if title: e_em.title=title
+        if self.pinned_p:
+            try: await self.pinned_p.edit(embed=p_em)
+            except: pass
+        if self.pinned_e:
+            try: await self.pinned_e.edit(embed=e_em)
             except: pass
 
 class IWFDuelSession:
@@ -984,16 +1009,21 @@ class IWFDuelSession:
         self.challenger=challenger; self.opponent=opponent; self.channel=channel
         self.c_name=cn; self.c_class=cc; self.o_name=on_; self.o_class=oc
         self.c_hp=IWF_MAX_HP; self.o_hp=IWF_MAX_HP; self.round=1
-        self.c_pick=self.o_pick=None; self.active=True; self.pinned=None
-    async def refresh(self,title="IWF Duel"):
-        if self.pinned:
-            try: await self.pinned.edit(embed=iwf_duel_em(self.c_name,self.c_class["gif"],self.c_hp,self.o_name,self.o_class["gif"],self.o_hp,self.round,self.c_pick is not None,self.o_pick is not None,title=title))
+        self.c_pick=self.o_pick=None; self.active=True
+        self.pinned_c=None; self.pinned_o=None; self.last_pick_msg=None
+    async def refresh(self,title=""):
+        c_em,o_em=iwf_duel_ems(self.c_name,self.c_class["gif"],self.c_hp,self.o_name,self.o_class["gif"],self.o_hp,self.round,self.c_pick is not None,self.o_pick is not None)
+        if title: o_em.title=title
+        if self.pinned_c:
+            try: await self.pinned_c.edit(embed=c_em)
+            except: pass
+        if self.pinned_o:
+            try: await self.pinned_o.edit(embed=o_em)
             except: pass
 
 async def iwf_end_pve(ch,s,sk,iwf_sessions):
     if s.p_hp<=0: title="Defeated!"; desc=random.choice(IWF_LOSE); color=0xe05050
-    elif s.e_hp<=0: title="Victory!"; desc=random.choice(IWF_WIN); color=0x50e090
-    else: title="Draw!"; desc="10 rounds — no winner!"; color=0xf0d060
+    else: title="Victory!"; desc=random.choice(IWF_WIN); color=0x50e090
     await s.refresh(title)
     result_msg=await ch.send(embed=discord.Embed(title=title,description=desc,color=color))
     await asyncio.sleep(3)
@@ -1001,8 +1031,10 @@ async def iwf_end_pve(ch,s,sk,iwf_sessions):
     to_delete=[m for m in s.battle_msgs if m is not None]
     to_delete.append(result_msg)
     await bulk_delete(ch,to_delete)
-    # Unpin the battle card
-    try: await s.pinned.unpin()
+    # Unpin both battle cards
+    try:
+        if hasattr(s,"pinned_p") and s.pinned_p: await s.pinned_p.unpin()
+        if hasattr(s,"pinned_e") and s.pinned_e: await s.pinned_e.unpin()
     except: pass
     em2=discord.Embed(title="Choose Next Opponent",color=0x2a55c0)
     for k,e in IWF_ENEMIES.items(): em2.add_field(name=e["name"],value=e["desc"],inline=False)
@@ -1010,10 +1042,8 @@ async def iwf_end_pve(ch,s,sk,iwf_sessions):
 
 async def iwf_end_duel(d,iwf_duels):
     d.active=False
-    if d.c_hp<=0 and d.o_hp<=0: title="Draw!"; color=0xf0d060; w=l=None
-    elif d.c_hp<=0: title=f"{d.o_name} Wins!"; color=0x50e090; w=d.opponent; l=d.challenger
-    elif d.o_hp<=0: title=f"{d.c_name} Wins!"; color=0x50e090; w=d.challenger; l=d.opponent
-    else: title="Draw!"; color=0xf0d060; w=l=None
+    if d.c_hp<=0: title=f"{d.o_name} Wins!"; color=0x50e090; w=d.opponent; l=d.challenger
+    else: title=f"{d.c_name} Wins!"; color=0x50e090; w=d.challenger; l=d.opponent
     await d.refresh(title)
     em=discord.Embed(title=title,description=random.choice(IWF_WIN) if w else "No winner!",color=color)
     if w and l: em.add_field(name="Result",value=f"{w.mention} defeats {l.mention}!",inline=False)
@@ -1037,13 +1067,18 @@ class IWFPickView(discord.ui.View):
             await i.response.defer(); self.stop()
             ep=s.enemy["element"] if random.random()<0.5 else random.choice(list(ELEMENTS.keys()))
             out=iwf_resolve(pp,ep); flavor=REVEAL.get((pp,ep),"The elements clash!")
-            if out=="a": s.e_hp-=1; result=f"**{s.char_name}** wins! {flavor}"
-            elif out=="b": s.p_hp-=1; result=f"**{s.enemy['name']}** wins! {flavor}"
+            if out=="a": s.e_hp=max(0,s.e_hp-10); result=f"**{s.char_name}** wins! {flavor}"
+            elif out=="b": s.p_hp=max(0,s.p_hp-10); result=f"**{s.enemy['name']}** wins! {flavor}"
             else: result=f"Tie! {flavor}"
+            # Delete the previous pick prompt (last msg in battle_msgs that had buttons)
+            if s.battle_msgs:
+                try: await s.battle_msgs[-1].delete()
+                except: pass
+                s.battle_msgs.pop()
             msg=await i.followup.send(f"**Round {s.round}!**\n{s.char_name}: {ELEMENTS[pp]['emoji']} **{pp.capitalize()}**\n{s.enemy['name']}: {ELEMENTS[ep]['emoji']} **{ep.capitalize()}**\n\n{result}")
             s.battle_msgs.append(msg)
-            s.round+=1; await s.refresh(); await asyncio.sleep(4); await msg.delete()
-            if s.p_hp<=0 or s.e_hp<=0 or s.round>IWF_ROUNDS: await iwf_end_pve(i.channel,s,self.sk,self.iwf_sessions)
+            s.round+=1; await s.refresh(); await asyncio.sleep(4); await msg.delete(); s.battle_msgs.pop()
+            if s.p_hp<=0 or s.e_hp<=0: await iwf_end_pve(i.channel,s,self.sk,self.iwf_sessions)
             else:
                 next_msg=await i.channel.send(f"Round {s.round} — Pick:",view=IWFPickView(s,self.sk,self.iwf_sessions,i.channel))
                 s.battle_msgs.append(next_msg)
@@ -1074,13 +1109,20 @@ class IWFDuelPickView(discord.ui.View):
                 self.stop()
                 cp,op=d.c_pick,d.o_pick; d.c_pick=d.o_pick=None
                 out=iwf_resolve(cp,op); flavor=REVEAL.get((cp,op),"The elements clash!")
-                if out=="a": d.o_hp-=1; result=f"**{d.c_name}** wins! {flavor}"
-                elif out=="b": d.c_hp-=1; result=f"**{d.o_name}** wins! {flavor}"
+                if out=="a": d.o_hp=max(0,d.o_hp-10); result=f"**{d.c_name}** wins! {flavor}"
+                elif out=="b": d.c_hp=max(0,d.c_hp-10); result=f"**{d.o_name}** wins! {flavor}"
                 else: result=f"Tie! {flavor}"
+                # Delete the previous pick prompt
+                if hasattr(d,"last_pick_msg") and d.last_pick_msg:
+                    try: await d.last_pick_msg.delete()
+                    except: pass
+                    d.last_pick_msg=None
                 msg=await d.channel.send(f"**Round {d.round}!**\n{d.c_name}: {ELEMENTS[cp]['emoji']} **{cp.capitalize()}**\n{d.o_name}: {ELEMENTS[op]['emoji']} **{op.capitalize()}**\n\n{result}")
                 d.round+=1; await d.refresh(); await asyncio.sleep(4); await msg.delete()
-                if d.c_hp<=0 or d.o_hp<=0 or d.round>IWF_ROUNDS: await iwf_end_duel(d,self.iwf_duels)
-                else: await d.channel.send(f"Round {d.round} — Both pick:",view=IWFDuelPickView(d,self.iwf_duels))
+                if d.c_hp<=0 or d.o_hp<=0: await iwf_end_duel(d,self.iwf_duels)
+                else:
+                    next_msg=await d.channel.send(f"Round {d.round} — Both pick:",view=IWFDuelPickView(d,self.iwf_duels))
+                    d.last_pick_msg=next_msg
         return cb
 
 class IWFEnemyView(discord.ui.View):
@@ -1098,13 +1140,13 @@ class IWFEnemyView(discord.ui.View):
             cn=save["char_name"] if isinstance(save,dict) else save.char_name
             cc=save["class"] if isinstance(save,dict) else save.char_class
             s=IWFSession(i.user,cn,cc,key); self.iwf_sessions[self.sk]=s
-            em=iwf_battle_em(s.char_name,s.char_class["name"],s.char_class["gif"],s.p_hp,e["name"],e["element"].capitalize(),e["gif"],s.e_hp,s.round,title=f"{s.char_name} vs {e['name']}",footer=e["desc"])
-            msg=await self.ch.send(embed=em)
-            s.battle_msgs.append(msg)
-            try: await msg.pin()
+            p_em,e_em=iwf_battle_ems(s.char_name,s.char_class["name"],s.char_class["gif"],s.p_hp,e["name"],e["element"].capitalize(),e["gif"],s.e_hp,s.round,footer=e["desc"])
+            pm=await self.ch.send(embed=p_em); em_=await self.ch.send(embed=e_em)
+            s.battle_msgs.extend([pm,em_])
+            try: await pm.pin(); await em_.pin()
             except: pass
-            s.pinned=msg
-            pick_msg=await self.ch.send(f"Round 1 — Pick your element:",view=IWFPickView(s,self.sk,self.iwf_sessions,self.ch))
+            s.pinned_p=pm; s.pinned_e=em_
+            pick_msg=await self.ch.send("Round 1 — Pick your element:",view=IWFPickView(s,self.sk,self.iwf_sessions,self.ch))
             s.battle_msgs.append(pick_msg)
         return cb
 
@@ -1211,11 +1253,13 @@ class IceWindFire(commands.Cog):
         except: pass
         d=IWFDuelSession(data["challenger"],ctx.author,cs.char_name,cs.char_class,os_.char_name,os_.char_class,ch)
         self.iwf_duels[ch.id]=d
-        em=iwf_duel_em(d.c_name,d.c_class["gif"],d.c_hp,d.o_name,d.o_class["gif"],d.o_hp,d.round,False,False,title="🧊🌪🔥 IWF DUEL BEGINS!")
-        msg=await ch.send(embed=em)
-        try: await msg.pin()
+        c_em,o_em=iwf_duel_ems(d.c_name,d.c_class["gif"],d.c_hp,d.o_name,d.o_class["gif"],d.o_hp,d.round,False,False)
+        c_em.title="🧊🌪🔥 IWF DUEL"; o_em.title="🧊🌪🔥 BEGINS!"
+        cm=await ch.send(embed=c_em); om=await ch.send(embed=o_em)
+        try: await cm.pin(); await om.pin()
         except: pass
-        d.pinned=msg; await ch.send(f"Round 1 — Both pick!\n{data['challenger'].mention} and {ctx.author.mention}",view=IWFDuelPickView(d,self.iwf_duels))
+        d.pinned_c=cm; d.pinned_o=om
+        first_msg=await ch.send(f"Round 1 — Both pick!\n{data['challenger'].mention} and {ctx.author.mention}",view=IWFDuelPickView(d,self.iwf_duels))
         await ctx.send(f"IWF duel accepted! Head to {ch.mention}!")
 
     @commands.command(name="ffqdecline")
